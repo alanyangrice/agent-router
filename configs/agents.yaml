@@ -1,0 +1,10 @@
+agents:
+  - id: example-coder
+    role: coder
+    name: "Example Coder"
+    skills:
+      - go
+      - python
+      - javascript
+    model: "claude-4-sonnet"
+    prompt_template: "agents/example/prompt.txt"
