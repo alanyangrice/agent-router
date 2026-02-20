@@ -83,6 +83,9 @@ func listAgents(svc *agentsvc.Service) gin.HandlerFunc {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
+		if agents == nil {
+			agents = []domainagent.Agent{}
+		}
 		c.JSON(http.StatusOK, agents)
 	}
 }

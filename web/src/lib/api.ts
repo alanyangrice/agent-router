@@ -74,7 +74,7 @@ export interface Project {
 
 export const api = {
   createProject: (data: { name: string; repo_url: string }) =>
-    fetchAPI<Project>("/api/projects", {
+    fetchAPI<Project>("/api/projects/", {
       method: "POST",
       body: JSON.stringify(data),
     }),
@@ -82,11 +82,11 @@ export const api = {
 
   listTasks: (params?: Record<string, string>) => {
     const query = params ? "?" + new URLSearchParams(params).toString() : "";
-    return fetchAPI<Task[]>(`/api/tasks${query}`);
+    return fetchAPI<Task[]>(`/api/tasks/${query}`);
   },
   getTask: (id: string) => fetchAPI<Task>(`/api/tasks/${id}`),
   createTask: (data: Partial<Task>) =>
-    fetchAPI<Task>("/api/tasks", {
+    fetchAPI<Task>("/api/tasks/", {
       method: "POST",
       body: JSON.stringify(data),
     }),
@@ -98,7 +98,7 @@ export const api = {
 
   listThreads: (params?: Record<string, string>) => {
     const query = params ? "?" + new URLSearchParams(params).toString() : "";
-    return fetchAPI<Thread[]>(`/api/threads${query}`);
+    return fetchAPI<Thread[]>(`/api/threads/${query}`);
   },
   listMessages: (threadId: string) =>
     fetchAPI<Message[]>(`/api/threads/${threadId}/messages`),
@@ -113,7 +113,7 @@ export const api = {
 
   listAgents: (params?: Record<string, string>) => {
     const query = params ? "?" + new URLSearchParams(params).toString() : "";
-    return fetchAPI<Agent[]>(`/api/agents${query}`);
+    return fetchAPI<Agent[]>(`/api/agents/${query}`);
   },
   getAgent: (id: string) => fetchAPI<Agent>(`/api/agents/${id}`),
 };

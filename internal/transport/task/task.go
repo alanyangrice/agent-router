@@ -79,6 +79,9 @@ func listTasks(svc *tasksvc.Service) gin.HandlerFunc {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
+		if tasks == nil {
+			tasks = []domaintask.Task{}
+		}
 		c.JSON(http.StatusOK, tasks)
 	}
 }

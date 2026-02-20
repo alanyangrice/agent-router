@@ -9,11 +9,11 @@ import (
 )
 
 type Project struct {
-	ID        uuid.UUID
-	Name      string
-	RepoURL   string
-	Config    map[string]interface{}
-	CreatedAt time.Time
+	ID        uuid.UUID              `json:"id"`
+	Name      string                 `json:"name"`
+	RepoURL   string                 `json:"repo_url"`
+	Config    map[string]interface{} `json:"config,omitempty"`
+	CreatedAt time.Time              `json:"created_at"`
 }
 
 type Repository interface {

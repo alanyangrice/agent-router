@@ -70,7 +70,7 @@ class ExampleAgent(BaseAgent):
         logger.info(f"Working on task: {task.title} ({task.id})")
 
         threads = self.client._http.get(
-            "/api/threads", params={"task_id": str(task.id)}
+            "/api/threads/", params={"task_id": str(task.id)}
         )
         thread_list = threads.json()
         if not thread_list:

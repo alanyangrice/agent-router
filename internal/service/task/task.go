@@ -9,19 +9,22 @@ import (
 
 	"github.com/alanyang/agent-mesh/internal/domain/event"
 	domaintask "github.com/alanyang/agent-mesh/internal/domain/task"
+	domainthread "github.com/alanyang/agent-mesh/internal/domain/thread"
 	portagent "github.com/alanyang/agent-mesh/internal/port/distributor"
 	portbus "github.com/alanyang/agent-mesh/internal/port/eventbus"
 	porttask "github.com/alanyang/agent-mesh/internal/port/task"
+	portthread "github.com/alanyang/agent-mesh/internal/port/thread"
 )
 
 type Service struct {
-	repo porttask.Repository
-	bus  portbus.EventBus
-	dist portagent.Distributor
+	repo       porttask.Repository
+	bus        portbus.EventBus
+	dist       portagent.Distributor
+	threadRepo portthread.Repository
 }
 
-func NewService(repo porttask.Repository, bus portbus.EventBus, dist portagent.Distributor) *Service {
-	return &Service{repo: repo, bus: bus, dist: dist}
+func NewService(repo porttask.Repository, bus portbus.EventBus, dist portagent.Distributor, threadRepo portthread.Repository) *Service {
+	return &Service{repo: repo, bus: bus, dist: dist, threadRepo: threadRepo}
 }
 
 func (s *Service) Create(ctx context.Context, projectID uuid.UUID, title, description string, priority domaintask.Priority, branchType domaintask.BranchType, createdBy string) (domaintask.Task, error) {
@@ -31,6 +34,11 @@ func (s *Service) Create(ctx context.Context, projectID uuid.UUID, title, descri
 	created, err := s.repo.Create(ctx, t)
 	if err != nil {
 		return domaintask.Task{}, fmt.Errorf("create task: %w", err)
+	}
+
+	thread := domainthread.New(projectID, domainthread.TypeTask, title, &created.ID)
+	if _, err := s.threadRepo.CreateThread(ctx, thread); err != nil {
+		slog.ErrorContext(ctx, "failed to auto-create task thread", "task_id", created.ID, "error", err)
 	}
 
 	if err := s.bus.Publish(ctx, event.New(event.TypeTaskCreated, created.ID)); err != nil {

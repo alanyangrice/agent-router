@@ -11,9 +11,33 @@ import (
 )
 
 func Register(rg *gin.RouterGroup, svc *threadsvc.Service) {
+	rg.POST("/", createThread(svc))
 	rg.GET("/", listThreads(svc))
 	rg.GET("/:id/messages", listMessages(svc))
 	rg.POST("/:id/messages", postMessage(svc))
+}
+
+type createThreadReq struct {
+	ProjectID uuid.UUID              `json:"project_id" binding:"required"`
+	TaskID    *uuid.UUID             `json:"task_id"`
+	Type      domainthread.ThreadType `json:"type" binding:"required"`
+	Name      string                 `json:"name" binding:"required"`
+}
+
+func createThread(svc *threadsvc.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req createThreadReq
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		t, err := svc.CreateThread(c.Request.Context(), req.ProjectID, req.Type, req.Name, req.TaskID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusCreated, t)
+	}
 }
 
 func listThreads(svc *threadsvc.Service) gin.HandlerFunc {
@@ -46,6 +70,9 @@ func listThreads(svc *threadsvc.Service) gin.HandlerFunc {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
+		if threads == nil {
+			threads = []domainthread.Thread{}
+		}
 		c.JSON(http.StatusOK, threads)
 	}
 }
@@ -62,6 +89,9 @@ func listMessages(svc *threadsvc.Service) gin.HandlerFunc {
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
+		}
+		if msgs == nil {
+			msgs = []domainthread.Message{}
 		}
 		c.JSON(http.StatusOK, msgs)
 	}
