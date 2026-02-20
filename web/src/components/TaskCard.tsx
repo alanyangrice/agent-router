@@ -23,15 +23,20 @@ function isStuck(task: Task): boolean {
 export function TaskCard({
   task,
   agentName,
+  onClick,
 }: {
   task: Task;
   agentName?: string;
+  onClick?: () => void;
 }) {
   const stuck = isStuck(task);
 
   return (
     <div
+      onClick={onClick}
       className={`group relative rounded-lg border p-3 transition-colors hover:border-gray-600 ${
+        onClick ? "cursor-pointer" : ""
+      } ${
         stuck
           ? "border-yellow-500/50 bg-yellow-900/10"
           : "border-gray-700 bg-gray-800"

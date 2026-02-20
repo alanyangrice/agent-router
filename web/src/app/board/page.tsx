@@ -5,6 +5,7 @@ import { api, Task, Agent } from "@/lib/api";
 import { useWebSocket } from "@/hooks/useWebSocket";
 import { DashboardShell } from "@/components/DashboardShell";
 import { TaskCard } from "@/components/TaskCard";
+import { TaskDetailPanel } from "@/components/TaskDetailPanel";
 
 const COLUMNS: { key: Task["status"]; label: string; color: string }[] = [
   { key: "backlog", label: "Backlog", color: "bg-gray-500" },
@@ -19,6 +20,7 @@ export default function BoardPage() {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [loading, setLoading] = useState(true);
   const [showCreateForm, setShowCreateForm] = useState(false);
+  const [selectedTask, setSelectedTask] = useState<Task | null>(null);
 
   const fetchData = useCallback(async () => {
     try {
@@ -115,6 +117,7 @@ export default function BoardPage() {
                             ? agentMap.get(task.assigned_agent_id)?.name
                             : undefined
                         }
+                        onClick={() => setSelectedTask(task)}
                       />
                     ))
                   )}
@@ -123,6 +126,12 @@ export default function BoardPage() {
             );
           })}
         </div>
+      )}
+      {selectedTask && (
+        <TaskDetailPanel
+          task={selectedTask}
+          onClose={() => setSelectedTask(null)}
+        />
       )}
     </DashboardShell>
   );

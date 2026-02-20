@@ -24,13 +24,13 @@ const STATUS_LABELS: Record<string, string> = {
   offline: "Offline",
 };
 
-export function StatusBadge({ status }: { status: string }) {
+export function StatusBadge({ status, className = "" }: { status: string; className?: string }) {
   const style = STATUS_STYLES[status] || "bg-gray-600 text-gray-200";
   const label = STATUS_LABELS[status] || status;
 
   return (
     <span
-      className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${style}`}
+      className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${style} ${className}`}
     >
       {label}
     </span>
