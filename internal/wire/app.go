@@ -12,6 +12,7 @@ import (
 	pgdb "github.com/alanyang/agent-mesh/internal/adapter/postgres"
 	pgagent "github.com/alanyang/agent-mesh/internal/adapter/postgres/agent"
 	pgeventbus "github.com/alanyang/agent-mesh/internal/adapter/postgres/eventbus"
+	pgproject "github.com/alanyang/agent-mesh/internal/adapter/postgres/project"
 	pgtask "github.com/alanyang/agent-mesh/internal/adapter/postgres/task"
 	pgthread "github.com/alanyang/agent-mesh/internal/adapter/postgres/thread"
 
@@ -64,7 +65,7 @@ func Build(ctx context.Context) (*App, error) {
 
 	// ── Services ────────────────────────────────────────────────────────
 	distSvc := distsvc.NewService(taskRepo, agentRepo)
-	taskSvc := tasksvc.NewService(taskRepo, eventBus, distSvc)
+	taskSvc := tasksvc.NewService(taskRepo, eventBus, distSvc, threadRepo)
 	threadSvc := threadsvc.NewService(threadRepo, eventBus)
 	agentSvc := agentsvc.NewService(agentRepo, taskRepo, eventBus)
 
@@ -73,9 +74,8 @@ func Build(ctx context.Context) (*App, error) {
 		gitSvcInstance = gitsvc.NewService(gitProvider)
 	}
 
-	// No postgres project adapter yet – pass nil so the project endpoints
-	// will panic if hit; wire a real repo once the migration is in place.
-	projectSvcInstance := projectsvc.NewService(nil)
+	projectRepo := pgproject.New(pool)
+	projectSvcInstance := projectsvc.NewService(projectRepo)
 
 	// ── Transport ───────────────────────────────────────────────────────
 	router := transport.NewRouter(taskSvc, threadSvc, agentSvc, gitSvcInstance, projectSvcInstance, eventBus)

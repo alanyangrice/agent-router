@@ -32,7 +32,7 @@ class AgentMeshClient:
         params: dict[str, str] = {"project_id": str(project_id)}
         if status:
             params["status"] = status.value
-        resp = self._http.get("/api/tasks", params=params)
+        resp = self._http.get("/api/tasks/", params=params)
         resp.raise_for_status()
         return [Task(**t) for t in resp.json()]
 
