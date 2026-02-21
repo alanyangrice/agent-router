@@ -7,10 +7,26 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// noisyPaths are high-frequency read paths logged at Debug to keep Info clean.
+var noisyPaths = map[string]bool{
+	"/api/tasks/":   true,
+	"/api/agents/":  true,
+	"/api/ws":       true,
+}
+
 func RequestLogger() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
 		c.Next()
+
+		// Skip OPTIONS preflights and noisy polling GETs entirely.
+		if c.Request.Method == "OPTIONS" {
+			return
+		}
+		if c.Request.Method == "GET" && noisyPaths[c.Request.URL.Path] {
+			return
+		}
+
 		slog.Info("request",
 			"method", c.Request.Method,
 			"path", c.Request.URL.Path,

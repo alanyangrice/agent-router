@@ -4,7 +4,7 @@ import time
 import logging
 from uuid import UUID
 from agent_sdk.client import AgentMeshClient
-from agent_sdk.types import Task, PostType
+from agent_sdk.types import Task, TaskStatus, PostType
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +46,14 @@ class BaseAgent(abc.ABC):
     def run(self):
         """Main agent loop. Override in subclass."""
         ...
+
+    def get_assigned_tasks(self) -> list[Task]:
+        """Return ready tasks assigned to this agent. Call client.update_task_status to in_progress when starting work."""
+        return self.client.list_tasks(
+            self.project_id,
+            status=TaskStatus.READY,
+            assigned_to=self.agent_id,
+        )
 
     def post_update(self, thread_id: UUID, content: str, post_type: PostType = PostType.PROGRESS):
         return self.client.post_message(thread_id, self.agent_id, post_type, content)
