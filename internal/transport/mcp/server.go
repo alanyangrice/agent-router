@@ -66,11 +66,6 @@ func (s *Server) Handler() http.Handler {
 	return s.httpSrv
 }
 
-// Registry returns the session registry (implements AgentNotifier + RoleNotifier).
-func (s *Server) Registry() *SessionRegistry {
-	return s.reg
-}
-
 func (s *Server) onSessionClose(ctx context.Context, session mcpserver.ClientSession) {
 	agentID, ok := s.reg.Unregister(session.SessionID())
 	if !ok {

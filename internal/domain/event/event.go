@@ -9,14 +9,13 @@ import (
 type Type string
 
 const (
-	TypeTaskCreated    Type = "task_created"
-	TypeTaskUpdated    Type = "task_updated"
-	TypeTaskAssigned   Type = "task_assigned"
-	TypeTaskCompleted  Type = "task_completed"
-	TypeThreadMessage  Type = "thread_message"
-	TypeAgentOnline    Type = "agent_online"
-	TypeAgentOffline   Type = "agent_offline"
-	TypeAgentHeartbeat Type = "agent_heartbeat"
+	TypeTaskCreated   Type = "task_created"
+	TypeTaskUpdated   Type = "task_updated"
+	TypeTaskAssigned  Type = "task_assigned"
+	TypeTaskCompleted Type = "task_completed"
+	TypeThreadMessage Type = "thread_message"
+	TypeAgentOnline   Type = "agent_online"
+	TypeAgentOffline  Type = "agent_offline"
 )
 
 // Channel is a domain-scoped Postgres NOTIFY channel.
@@ -29,14 +28,13 @@ const (
 )
 
 var typeToChannel = map[Type]Channel{
-	TypeTaskCreated:    ChannelTask,
-	TypeTaskUpdated:    ChannelTask,
-	TypeTaskAssigned:   ChannelTask,
-	TypeTaskCompleted:  ChannelTask,
-	TypeAgentOnline:    ChannelAgent,
-	TypeAgentOffline:   ChannelAgent,
-	TypeAgentHeartbeat: ChannelAgent,
-	TypeThreadMessage:  ChannelThread,
+	TypeTaskCreated:   ChannelTask,
+	TypeTaskUpdated:   ChannelTask,
+	TypeTaskAssigned:  ChannelTask,
+	TypeTaskCompleted: ChannelTask,
+	TypeAgentOnline:   ChannelAgent,
+	TypeAgentOffline:  ChannelAgent,
+	TypeThreadMessage: ChannelThread,
 }
 
 func ChannelFor(t Type) Channel { return typeToChannel[t] }

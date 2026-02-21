@@ -48,14 +48,6 @@ func NewRouter(
 	agenthandler.Register(api.Group("/agents"), agentSvc)
 
 	// Prompt editor endpoints: GET/PUT /api/projects/:id/prompts/:role
-	api.Group("/projects/:id/prompts").Any("/*role", func(c *gin.Context) {
-		// strip the leading slash from the role wildcard
-		role := c.Param("role")
-		if len(role) > 1 {
-			c.Params = append(c.Params, gin.Param{Key: "role", Value: role[1:]})
-		}
-		c.Next()
-	})
 	prompthandler.Register(api.Group("/projects/:id/prompts"), promptSvc)
 
 	hub := wshandler.NewHub()
@@ -73,9 +65,6 @@ func NewRouter(
 	} {
 		c := ch
 		if _, err := eventBus.Subscribe(ctx, c, func(_ context.Context, e event.Event) {
-			if e.Type == event.TypeAgentHeartbeat {
-				return
-			}
 			hub.Broadcast(e)
 		}); err != nil {
 			slog.Error("failed to subscribe channel to WS hub", "channel", c, "error", err)

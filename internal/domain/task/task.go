@@ -1,7 +1,6 @@
 package task
 
 import (
-	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -89,25 +88,6 @@ func New(projectID uuid.UUID, title, description string, priority Priority, bran
 		CreatedAt:   now,
 		UpdatedAt:   now,
 	}
-}
-
-func (t *Task) TransitionTo(target Status) error {
-	if !t.Status.CanTransitionTo(target) {
-		return fmt.Errorf("invalid transition from %s to %s", t.Status, target)
-	}
-
-	now := time.Now().UTC()
-	t.Status = target
-	t.UpdatedAt = now
-
-	switch target {
-	case StatusInProgress:
-		t.StartedAt = &now
-	case StatusMerged:
-		t.CompletedAt = &now
-	}
-
-	return nil
 }
 
 type Dependency struct {

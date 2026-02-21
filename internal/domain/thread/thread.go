@@ -45,13 +45,12 @@ func New(projectID uuid.UUID, threadType ThreadType, name string, taskID *uuid.U
 }
 
 type Message struct {
-	ID        uuid.UUID              `json:"id"`
-	ThreadID  uuid.UUID              `json:"thread_id"`
-	AgentID   *uuid.UUID             `json:"agent_id,omitempty"`
-	PostType  PostType               `json:"post_type"`
-	Content   string                 `json:"content"`
-	Metadata  map[string]interface{} `json:"metadata,omitempty"`
-	CreatedAt time.Time              `json:"created_at"`
+	ID        uuid.UUID  `json:"id"`
+	ThreadID  uuid.UUID  `json:"thread_id"`
+	AgentID   *uuid.UUID `json:"agent_id,omitempty"`
+	PostType  PostType   `json:"post_type"`
+	Content   string     `json:"content"`
+	CreatedAt time.Time  `json:"created_at"`
 }
 
 func NewMessage(threadID uuid.UUID, agentID *uuid.UUID, postType PostType, content string) Message {
@@ -61,7 +60,6 @@ func NewMessage(threadID uuid.UUID, agentID *uuid.UUID, postType PostType, conte
 		AgentID:   agentID,
 		PostType:  postType,
 		Content:   content,
-		Metadata:  map[string]interface{}{},
 		CreatedAt: time.Now().UTC(),
 	}
 }
@@ -69,5 +67,4 @@ func NewMessage(threadID uuid.UUID, agentID *uuid.UUID, postType PostType, conte
 type ListFilters struct {
 	ProjectID *uuid.UUID
 	TaskID    *uuid.UUID
-	Type      *ThreadType
 }

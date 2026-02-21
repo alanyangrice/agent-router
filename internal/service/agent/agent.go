@@ -42,25 +42,6 @@ func (s *Service) Register(ctx context.Context, projectID uuid.UUID, role, name,
 	return created, nil
 }
 
-// UpsertBySession updates an existing agent record or creates a new one.
-// Used by the MCP server when an agent reconnects with a known agent_id.
-func (s *Service) UpsertBySession(ctx context.Context, agentID uuid.UUID, projectID uuid.UUID, role, name, model string, skills []string) (domainagent.Agent, error) {
-	existing, err := s.repo.GetByID(ctx, agentID)
-	if err == nil {
-		// Agent already exists — just mark it online
-		if err := s.repo.UpdateStatus(ctx, existing.ID, domainagent.StatusIdle); err != nil {
-			return domainagent.Agent{}, fmt.Errorf("reactivate agent: %w", err)
-		}
-		existing.Status = domainagent.StatusIdle
-		if err := s.bus.Publish(ctx, event.New(event.TypeAgentOnline, existing.ID)); err != nil {
-			slog.ErrorContext(ctx, "failed to publish AgentOnline event", "agent_id", existing.ID, "error", err)
-		}
-		return existing, nil
-	}
-	// New agent
-	return s.Register(ctx, projectID, role, name, model, skills)
-}
-
 func (s *Service) GetByID(ctx context.Context, id uuid.UUID) (domainagent.Agent, error) {
 	a, err := s.repo.GetByID(ctx, id)
 	if err != nil {
@@ -77,28 +58,22 @@ func (s *Service) List(ctx context.Context, filters domainagent.ListFilters) ([]
 	return agents, nil
 }
 
-func (s *Service) MarkOnline(ctx context.Context, id uuid.UUID) error {
-	if err := s.repo.UpdateStatus(ctx, id, domainagent.StatusIdle); err != nil {
-		return fmt.Errorf("mark agent online: %w", err)
+// Reactivate marks an existing agent as idle and publishes TypeAgentOnline.
+// Called when an agent reconnects with a previously-issued agent_id.
+// Returns an error if the agent does not exist — the caller should fall back to Register.
+func (s *Service) Reactivate(ctx context.Context, agentID uuid.UUID) (domainagent.Agent, error) {
+	a, err := s.repo.GetByID(ctx, agentID)
+	if err != nil {
+		return domainagent.Agent{}, fmt.Errorf("agent not found: %w", err)
 	}
-	if err := s.bus.Publish(ctx, event.New(event.TypeAgentOnline, id)); err != nil {
-		slog.ErrorContext(ctx, "failed to publish AgentOnline event", "agent_id", id, "error", err)
+	if err := s.repo.UpdateStatus(ctx, agentID, domainagent.StatusIdle); err != nil {
+		return domainagent.Agent{}, fmt.Errorf("reactivate agent: %w", err)
 	}
-	return nil
-}
-
-func (s *Service) MarkWorking(ctx context.Context, id uuid.UUID) error {
-	return s.repo.UpdateStatus(ctx, id, domainagent.StatusWorking)
-}
-
-func (s *Service) MarkOffline(ctx context.Context, id uuid.UUID) error {
-	if err := s.repo.UpdateStatus(ctx, id, domainagent.StatusOffline); err != nil {
-		return fmt.Errorf("mark agent offline: %w", err)
+	a.Status = domainagent.StatusIdle
+	if err := s.bus.Publish(ctx, event.New(event.TypeAgentOnline, agentID)); err != nil {
+		slog.ErrorContext(ctx, "failed to publish AgentOnline on reactivate", "agent_id", agentID, "error", err)
 	}
-	if err := s.bus.Publish(ctx, event.New(event.TypeAgentOffline, id)); err != nil {
-		slog.ErrorContext(ctx, "failed to publish AgentOffline event", "agent_id", id, "error", err)
-	}
-	return nil
+	return a, nil
 }
 
 // ReapOrphaned is called by the MCP server when an agent's SSE session closes.

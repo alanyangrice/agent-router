@@ -123,30 +123,6 @@ func (r *Repository) List(ctx context.Context, filters domaintask.ListFilters) (
 	return scanTasks(rows)
 }
 
-func (r *Repository) Update(ctx context.Context, t domaintask.Task) error {
-	query := `
-		UPDATE tasks SET
-			title = $2, description = $3, status = $4, priority = $5,
-			assigned_agent_id = $6, parent_task_id = $7, branch_type = $8,
-			branch_name = $9, labels = $10, required_role = $11, pr_url = $12,
-			updated_at = $13, started_at = $14, completed_at = $15
-		WHERE id = $1`
-
-	tag, err := r.pool.Exec(ctx, query,
-		t.ID, t.Title, t.Description, t.Status, t.Priority,
-		t.AssignedAgentID, t.ParentTaskID, t.BranchType, t.BranchName,
-		t.Labels, nilIfEmpty(t.RequiredRole), nilIfEmpty(t.PRUrl),
-		t.UpdatedAt, t.StartedAt, t.CompletedAt,
-	)
-	if err != nil {
-		return fmt.Errorf("updating task: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("task %s not found", t.ID)
-	}
-	return nil
-}
-
 func (r *Repository) UpdateStatus(ctx context.Context, id uuid.UUID, from, to domaintask.Status) error {
 	now := time.Now().UTC()
 	var query string
@@ -246,37 +222,6 @@ func (r *Repository) GetDependencies(ctx context.Context, taskID uuid.UUID) ([]d
 	rows, err := r.pool.Query(ctx, query, taskID)
 	if err != nil {
 		return nil, fmt.Errorf("getting dependencies: %w", err)
-	}
-	defer rows.Close()
-	return scanTasks(rows)
-}
-
-func (r *Repository) GetReadyTasks(ctx context.Context, projectID uuid.UUID, skills []string) ([]domaintask.Task, error) {
-	query := `
-		SELECT t.id, t.project_id, t.title, t.description, t.status, t.priority,
-			t.assigned_agent_id, t.parent_task_id, t.branch_type, t.branch_name,
-			t.labels, t.required_role, t.pr_url, t.created_by, t.created_at, t.updated_at, t.started_at, t.completed_at
-		FROM tasks t
-		WHERE t.project_id = $1
-		  AND t.status = 'ready'
-		  AND t.assigned_agent_id IS NULL
-		  AND NOT EXISTS (
-			SELECT 1 FROM task_dependencies td
-			JOIN tasks dep ON dep.id = td.depends_on_id
-			WHERE td.task_id = t.id AND dep.status != 'merged'
-		  )`
-
-	args := []interface{}{projectID}
-	if len(skills) > 0 {
-		query += " AND t.labels && $2"
-		args = append(args, skills)
-	}
-
-	query += " ORDER BY CASE t.priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 END, t.created_at"
-
-	rows, err := r.pool.Query(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("getting ready tasks: %w", err)
 	}
 	defer rows.Close()
 	return scanTasks(rows)

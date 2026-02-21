@@ -2,7 +2,6 @@ package thread
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -71,12 +70,8 @@ func (r *Repository) ListThreads(ctx context.Context, filters domainthread.ListF
 		args = append(args, *filters.TaskID)
 		argIdx++
 	}
-	if filters.Type != nil {
-		query += fmt.Sprintf(" AND type = $%d", argIdx)
-		args = append(args, string(*filters.Type))
-		argIdx++
-	}
 
+	_ = argIdx // no more filters; suppress unused warning
 	query += " ORDER BY created_at DESC"
 
 	rows, err := r.pool.Query(ctx, query, args...)
@@ -97,39 +92,27 @@ func (r *Repository) ListThreads(ctx context.Context, filters domainthread.ListF
 }
 
 func (r *Repository) CreateMessage(ctx context.Context, m domainthread.Message) (domainthread.Message, error) {
-	metaJSON, err := json.Marshal(m.Metadata)
-	if err != nil {
-		return domainthread.Message{}, fmt.Errorf("marshaling metadata: %w", err)
-	}
-
 	query := `
-		INSERT INTO messages (id, thread_id, agent_id, post_type, content, metadata_jsonb, created_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7)
-		RETURNING id, thread_id, agent_id, post_type, content, metadata_jsonb, created_at`
+		INSERT INTO messages (id, thread_id, agent_id, post_type, content, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6)
+		RETURNING id, thread_id, agent_id, post_type, content, created_at`
 
 	var created domainthread.Message
-	var metaBytes []byte
-	err = r.pool.QueryRow(ctx, query,
-		m.ID, m.ThreadID, m.AgentID, string(m.PostType), m.Content, metaJSON, m.CreatedAt,
+	err := r.pool.QueryRow(ctx, query,
+		m.ID, m.ThreadID, m.AgentID, string(m.PostType), m.Content, m.CreatedAt,
 	).Scan(
 		&created.ID, &created.ThreadID, &created.AgentID,
-		&created.PostType, &created.Content, &metaBytes, &created.CreatedAt,
+		&created.PostType, &created.Content, &created.CreatedAt,
 	)
 	if err != nil {
 		return domainthread.Message{}, fmt.Errorf("inserting message: %w", err)
-	}
-
-	if len(metaBytes) > 0 {
-		if err := json.Unmarshal(metaBytes, &created.Metadata); err != nil {
-			return domainthread.Message{}, fmt.Errorf("unmarshaling metadata: %w", err)
-		}
 	}
 	return created, nil
 }
 
 func (r *Repository) ListMessages(ctx context.Context, threadID uuid.UUID) ([]domainthread.Message, error) {
 	query := `
-		SELECT id, thread_id, agent_id, post_type, content, metadata_jsonb, created_at
+		SELECT id, thread_id, agent_id, post_type, content, created_at
 		FROM messages WHERE thread_id = $1
 		ORDER BY created_at ASC`
 
@@ -142,17 +125,11 @@ func (r *Repository) ListMessages(ctx context.Context, threadID uuid.UUID) ([]do
 	var messages []domainthread.Message
 	for rows.Next() {
 		var m domainthread.Message
-		var metaBytes []byte
 		if err := rows.Scan(
 			&m.ID, &m.ThreadID, &m.AgentID, &m.PostType,
-			&m.Content, &metaBytes, &m.CreatedAt,
+			&m.Content, &m.CreatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("scanning message row: %w", err)
-		}
-		if len(metaBytes) > 0 {
-			if err := json.Unmarshal(metaBytes, &m.Metadata); err != nil {
-				return nil, fmt.Errorf("unmarshaling metadata: %w", err)
-			}
 		}
 		messages = append(messages, m)
 	}

@@ -2,9 +2,7 @@ package mcp_test
 
 import (
 	"context"
-	"encoding/json"
 	"testing"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -188,23 +186,3 @@ func TestPromptFallback(t *testing.T) {
 	t.Skip("Requires running Postgres — run via scripts/test_v1_rest.sh")
 }
 
-// ── Helper ────────────────────────────────────────────────────────────────────
-
-func mustJSON(t *testing.T, v any) string {
-	t.Helper()
-	data, err := json.Marshal(v)
-	require.NoError(t, err)
-	return string(data)
-}
-
-func eventually(t *testing.T, cond func() bool, timeout time.Duration, msg string) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if cond() {
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	t.Fatalf("condition not met within %s: %s", timeout, msg)
-}

@@ -27,11 +27,12 @@ func RegisterTools(
 	threadSvc *threadsvc.Service,
 ) {
 	s.AddTool(mcpmcp.NewTool("register_agent",
-		mcpmcp.WithDescription("Register this agent with the platform. Call once at startup. Returns the agent_id."),
+		mcpmcp.WithDescription("Register this agent with the platform. Returns the agent_id. On reconnect, pass the previously issued agent_id to reuse the same record instead of creating a new one."),
 		mcpmcp.WithString("project_id", mcpmcp.Required(), mcpmcp.Description("Project UUID")),
 		mcpmcp.WithString("role", mcpmcp.Required(), mcpmcp.Description("Agent role: coder, qa, or reviewer")),
 		mcpmcp.WithString("name", mcpmcp.Required(), mcpmcp.Description("Human-readable agent name")),
 		mcpmcp.WithString("model", mcpmcp.Required(), mcpmcp.Description("LLM model identifier")),
+		mcpmcp.WithString("agent_id", mcpmcp.Description("Previously issued agent UUID. Pass on reconnect to reuse the existing agent record.")),
 	), registerAgentHandler(s, reg, agentSvc))
 
 	s.AddTool(mcpmcp.NewTool("claim_task",
@@ -63,12 +64,12 @@ func RegisterTools(
 		mcpmcp.WithString("content", mcpmcp.Required(), mcpmcp.Description("Message content")),
 		mcpmcp.WithString("post_type", mcpmcp.Required(), mcpmcp.Description("One of: progress, review_feedback, blocker, artifact, comment")),
 		mcpmcp.WithString("agent_id", mcpmcp.Description("Agent UUID (optional, used to attribute the message)")),
-	), postMessageHandler(taskSvc, threadSvc))
+	), postMessageHandler(threadSvc))
 
 	s.AddTool(mcpmcp.NewTool("list_messages",
 		mcpmcp.WithDescription("Read the full thread history for a task. Use to re-read QA or reviewer feedback."),
 		mcpmcp.WithString("task_id", mcpmcp.Required(), mcpmcp.Description("Task UUID")),
-	), listMessagesHandler(taskSvc, threadSvc))
+	), listMessagesHandler(threadSvc))
 }
 
 // ── Tool handlers ─────────────────────────────────────────────────────────
@@ -79,19 +80,37 @@ func registerAgentHandler(srv *mcpserver.MCPServer, reg *SessionRegistry, agentS
 		role := mcpmcp.ParseString(req, "role", "")
 		name := mcpmcp.ParseString(req, "name", "")
 		model := mcpmcp.ParseString(req, "model", "")
+		existingIDStr := mcpmcp.ParseString(req, "agent_id", "")
 
 		projectID, err := uuid.Parse(projectIDStr)
 		if err != nil {
 			return mcpmcp.NewToolResultText("error: invalid project_id"), nil
 		}
 
+		session := mcpserver.ClientSessionFromContext(ctx)
+
+		// Reconnect path: if the caller passes a previously-issued agent_id, reactivate
+		// that record instead of creating a new one. This preserves task assignments and
+		// thread history across restarts.
+		if existingIDStr != "" {
+			if existingID, err := uuid.Parse(existingIDStr); err == nil {
+				if agent, err := agentSvc.Reactivate(ctx, existingID); err == nil {
+					if session != nil {
+						reg.Register(session.SessionID(), agent.ID, agent.ProjectID, agent.Role)
+					}
+					result, _ := json.Marshal(map[string]string{"agent_id": agent.ID.String()})
+					return mcpmcp.NewToolResultText(string(result)), nil
+				}
+				// Reactivate failed (agent not found in DB) — fall through to create new.
+			}
+		}
+
+		// First-time registration: create a new agent record.
 		agent, err := agentSvc.Register(ctx, projectID, role, name, model, []string{})
 		if err != nil {
 			return mcpmcp.NewToolResultText(fmt.Sprintf("error: %s", err)), nil
 		}
 
-		// Map this MCP session to the new agent.
-		session := mcpserver.ClientSessionFromContext(ctx)
 		if session != nil {
 			reg.Register(session.SessionID(), agent.ID, projectID, role)
 		}
@@ -114,28 +133,26 @@ func claimTaskHandler(taskSvc *tasksvc.Service, agentSvc *agentsvc.Service) mcps
 			return mcpmcp.NewToolResultText("error: agent not found"), nil
 		}
 
-		if agent.CurrentTaskID == nil {
-			// Check for ready-assigned tasks
-			status := domaintask.StatusReady
-			tasks, err := taskSvc.List(ctx, domaintask.ListFilters{
-				ProjectID:  &agent.ProjectID,
-				AssignedTo: &agentID,
-				Status:     &status,
-			})
-			if err != nil || len(tasks) == 0 {
-				return mcpmcp.NewToolResultText("null"), nil
-			}
-			data, _ := json.Marshal(tasks[0])
-			return mcpmcp.NewToolResultText(string(data)), nil
-		}
-
-		t, err := taskSvc.GetByID(ctx, *agent.CurrentTaskID)
+		// Query all tasks assigned to this agent across all active statuses.
+		// This handles reconnects correctly: a coder mid-task (in_progress, in_qa, etc.)
+		// will get their task back even if CurrentTaskID is not set on the agent record.
+		tasks, err := taskSvc.List(ctx, domaintask.ListFilters{
+			ProjectID:  &agent.ProjectID,
+			AssignedTo: &agentID,
+		})
 		if err != nil {
 			return mcpmcp.NewToolResultText("null"), nil
 		}
 
-		data, _ := json.Marshal(t)
-		return mcpmcp.NewToolResultText(string(data)), nil
+		// Return the first task that is not in a terminal status.
+		for _, t := range tasks {
+			if t.Status != domaintask.StatusMerged && t.Status != domaintask.StatusBacklog {
+				data, _ := json.Marshal(t)
+				return mcpmcp.NewToolResultText(string(data)), nil
+			}
+		}
+
+		return mcpmcp.NewToolResultText("null"), nil
 	}
 }
 
@@ -217,7 +234,7 @@ func setPRUrlHandler(taskSvc *tasksvc.Service) mcpserver.ToolHandlerFunc {
 	}
 }
 
-func postMessageHandler(taskSvc *tasksvc.Service, threadSvc *threadsvc.Service) mcpserver.ToolHandlerFunc {
+func postMessageHandler(threadSvc *threadsvc.Service) mcpserver.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpmcp.CallToolRequest) (*mcpmcp.CallToolResult, error) {
 		taskIDStr := mcpmcp.ParseString(req, "task_id", "")
 		content := mcpmcp.ParseString(req, "content", "")
@@ -254,7 +271,7 @@ func postMessageHandler(taskSvc *tasksvc.Service, threadSvc *threadsvc.Service) 
 	}
 }
 
-func listMessagesHandler(taskSvc *tasksvc.Service, threadSvc *threadsvc.Service) mcpserver.ToolHandlerFunc {
+func listMessagesHandler(threadSvc *threadsvc.Service) mcpserver.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpmcp.CallToolRequest) (*mcpmcp.CallToolResult, error) {
 		taskIDStr := mcpmcp.ParseString(req, "task_id", "")
 		taskID, err := uuid.Parse(taskIDStr)
