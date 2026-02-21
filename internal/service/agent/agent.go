@@ -138,6 +138,7 @@ func (s *Service) reap(ctx context.Context, thresholdSeconds int) {
 			continue
 		}
 
+		// Reset any in_progress task the agent was actively working on.
 		if a.CurrentTaskID != nil {
 			if err := s.taskRepo.UpdateStatus(ctx, *a.CurrentTaskID, domaintask.StatusInProgress, domaintask.StatusReady); err != nil {
 				slog.ErrorContext(ctx, "reaper: failed to reset task to ready", "task_id", *a.CurrentTaskID, "error", err)
@@ -148,6 +149,12 @@ func (s *Service) reap(ctx context.Context, thresholdSeconds int) {
 			if err := s.repo.SetCurrentTask(ctx, a.ID, nil); err != nil {
 				slog.ErrorContext(ctx, "reaper: failed to clear agent current task", "agent_id", a.ID, "error", err)
 			}
+		}
+
+		// Release any ready tasks assigned to this agent that it never started.
+		// These won't have a CurrentTaskID since the agent owns the ready→in_progress transition.
+		if err := s.taskRepo.UnassignByAgent(ctx, a.ID); err != nil {
+			slog.ErrorContext(ctx, "reaper: failed to release ready tasks for offline agent", "agent_id", a.ID, "error", err)
 		}
 
 		if err := s.bus.Publish(ctx, event.New(event.TypeAgentOffline, a.ID)); err != nil {
