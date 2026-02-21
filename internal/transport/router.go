@@ -9,14 +9,15 @@ import (
 	"github.com/alanyang/agent-mesh/internal/domain/event"
 	porteventbus "github.com/alanyang/agent-mesh/internal/port/eventbus"
 	agentsvc "github.com/alanyang/agent-mesh/internal/service/agent"
-	gitsvc "github.com/alanyang/agent-mesh/internal/service/git"
+	promptsvc "github.com/alanyang/agent-mesh/internal/service/prompt"
 	projectsvc "github.com/alanyang/agent-mesh/internal/service/project"
 	tasksvc "github.com/alanyang/agent-mesh/internal/service/task"
 	threadsvc "github.com/alanyang/agent-mesh/internal/service/thread"
+	mcptransport "github.com/alanyang/agent-mesh/internal/transport/mcp"
 
 	agenthandler "github.com/alanyang/agent-mesh/internal/transport/agent"
-	githandler "github.com/alanyang/agent-mesh/internal/transport/git"
 	projecthandler "github.com/alanyang/agent-mesh/internal/transport/project"
+	prompthandler "github.com/alanyang/agent-mesh/internal/transport/prompt"
 	taskhandler "github.com/alanyang/agent-mesh/internal/transport/task"
 	threadhandler "github.com/alanyang/agent-mesh/internal/transport/thread"
 	wshandler "github.com/alanyang/agent-mesh/internal/transport/ws"
@@ -27,8 +28,9 @@ func NewRouter(
 	taskSvc *tasksvc.Service,
 	threadSvc *threadsvc.Service,
 	agentSvc *agentsvc.Service,
-	gitSvc *gitsvc.Service,
 	projectSvc *projectsvc.Service,
+	promptSvc *promptsvc.Service,
+	mcpServer *mcptransport.Server,
 	eventBus porteventbus.EventBus,
 ) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
@@ -37,7 +39,6 @@ func NewRouter(
 	r.Use(gin.Recovery())
 	r.Use(RequestLogger())
 	r.Use(CORSMiddleware())
-	r.Use(IdempotencyMiddleware())
 
 	api := r.Group("/api")
 
@@ -45,20 +46,30 @@ func NewRouter(
 	taskhandler.Register(api.Group("/tasks"), taskSvc)
 	threadhandler.Register(api.Group("/threads"), threadSvc)
 	agenthandler.Register(api.Group("/agents"), agentSvc)
-	githandler.Register(api.Group("/git"), gitSvc)
+
+	// Prompt editor endpoints: GET/PUT /api/projects/:id/prompts/:role
+	api.Group("/projects/:id/prompts").Any("/*role", func(c *gin.Context) {
+		// strip the leading slash from the role wildcard
+		role := c.Param("role")
+		if len(role) > 1 {
+			c.Params = append(c.Params, gin.Param{Key: "role", Value: role[1:]})
+		}
+		c.Next()
+	})
+	prompthandler.Register(api.Group("/projects/:id/prompts"), promptSvc)
 
 	hub := wshandler.NewHub()
 	hub.Register(api.Group("/ws"))
 
-	// Bridge: one subscription per domain channel (4 total Postgres connections).
-	// All events within a channel are forwarded to WS clients; event.Type in the
-	// payload lets the client filter. AgentHeartbeat is excluded — it is in the
-	// agent channel but carries no actionable state for browsers or agents.
+	// MCP server at /mcp
+	r.Any("/mcp", gin.WrapH(mcpServer.Handler()))
+	r.Any("/mcp/*path", gin.WrapH(mcpServer.Handler()))
+
+	// Bridge: forward Postgres NOTIFY events to the WebSocket hub for dashboard.
 	for _, ch := range []event.Channel{
 		event.ChannelTask,
 		event.ChannelAgent,
 		event.ChannelThread,
-		event.ChannelGit,
 	} {
 		c := ch
 		if _, err := eventBus.Subscribe(ctx, c, func(_ context.Context, e event.Event) {

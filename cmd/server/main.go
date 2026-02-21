@@ -29,13 +29,11 @@ func main() {
 	}
 	defer app.Pool.Close()
 
-	// Reap stale agents every 90 seconds.
-	app.AgentSvc.StartReaper(ctx, 90)
+	// The MCP server handles agent liveness via SSE session hooks.
 
-	// Start HTTP server in background.
 	errCh := make(chan error, 1)
 	go func() {
-		slog.Info("HTTP server listening", "addr", app.Server.Addr)
+		slog.Info("HTTP + MCP server listening", "addr", app.Server.Addr)
 		if err := app.Server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}
@@ -51,7 +49,6 @@ func main() {
 		}
 	}
 
-	// Graceful shutdown with a 10-second deadline.
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 

@@ -49,7 +49,7 @@ export default function AgentsPage() {
   }, [fetchData]);
 
   useWebSocket((event) => {
-    if (event.type.startsWith("agent.") || event.type.startsWith("task.")) {
+    if (event.type.startsWith("agent") || event.type.startsWith("task")) {
       fetchData();
     }
   });
@@ -131,11 +131,14 @@ export default function AgentsPage() {
 
                 <div className="flex items-center justify-between border-t border-gray-700/50 pt-3 text-xs text-gray-500">
                   <span>Model: {agent.model}</span>
-                  {agent.last_heartbeat_at && (
-                    <span title={agent.last_heartbeat_at}>
-                      Heartbeat: {timeSince(agent.last_heartbeat_at)}
-                    </span>
-                  )}
+                  <span className={`flex items-center gap-1 ${
+                    agent.status === "offline" ? "text-red-400" : "text-green-400"
+                  }`}>
+                    <span className={`inline-block h-1.5 w-1.5 rounded-full ${
+                      agent.status === "offline" ? "bg-red-400" : "bg-green-400 animate-pulse"
+                    }`} />
+                    {agent.status === "offline" ? "Disconnected" : "MCP connected"}
+                  </span>
                 </div>
               </div>
             );

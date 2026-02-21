@@ -13,16 +13,18 @@ const (
 	StatusBacklog    Status = "backlog"
 	StatusReady      Status = "ready"
 	StatusInProgress Status = "in_progress"
+	StatusInQA       Status = "in_qa"
 	StatusInReview   Status = "in_review"
-	StatusDone       Status = "done"
+	StatusMerged     Status = "merged"
 )
 
 var validTransitions = map[Status][]Status{
 	StatusBacklog:    {StatusReady},
 	StatusReady:      {StatusInProgress, StatusBacklog},
-	StatusInProgress: {StatusInReview, StatusReady},
-	StatusInReview:   {StatusDone, StatusInProgress},
-	StatusDone:       {},
+	StatusInProgress: {StatusInQA, StatusReady},
+	StatusInQA:       {StatusInReview, StatusInProgress},
+	StatusInReview:   {StatusMerged, StatusInProgress},
+	StatusMerged:     {},
 }
 
 func (s Status) CanTransitionTo(target Status) bool {
@@ -52,38 +54,40 @@ const (
 )
 
 type Task struct {
-	ID             uuid.UUID  `json:"id"`
-	ProjectID      uuid.UUID  `json:"project_id"`
-	Title          string     `json:"title"`
-	Description    string     `json:"description"`
-	Status         Status     `json:"status"`
-	Priority       Priority   `json:"priority"`
+	ID              uuid.UUID  `json:"id"`
+	ProjectID       uuid.UUID  `json:"project_id"`
+	Title           string     `json:"title"`
+	Description     string     `json:"description"`
+	Status          Status     `json:"status"`
+	Priority        Priority   `json:"priority"`
 	AssignedAgentID *uuid.UUID `json:"assigned_agent_id,omitempty"`
-	ParentTaskID   *uuid.UUID `json:"parent_task_id,omitempty"`
-	BranchType     BranchType `json:"branch_type"`
-	BranchName     string     `json:"branch_name"`
-	Labels         []string   `json:"labels"`
-	CreatedBy      string     `json:"created_by"`
-	CreatedAt      time.Time  `json:"created_at"`
-	UpdatedAt      time.Time  `json:"updated_at"`
-	StartedAt      *time.Time `json:"started_at,omitempty"`
-	CompletedAt    *time.Time `json:"completed_at,omitempty"`
+	ParentTaskID    *uuid.UUID `json:"parent_task_id,omitempty"`
+	BranchType      BranchType `json:"branch_type"`
+	BranchName      string     `json:"branch_name"`
+	Labels          []string   `json:"labels"`
+	RequiredRole    string     `json:"required_role,omitempty"`
+	PRUrl           string     `json:"pr_url,omitempty"`
+	CreatedBy       string     `json:"created_by"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
+	StartedAt       *time.Time `json:"started_at,omitempty"`
+	CompletedAt     *time.Time `json:"completed_at,omitempty"`
 }
 
 func New(projectID uuid.UUID, title, description string, priority Priority, branchType BranchType, createdBy string) Task {
 	now := time.Now().UTC()
 	return Task{
-		ID:         uuid.New(),
-		ProjectID:  projectID,
-		Title:      title,
+		ID:          uuid.New(),
+		ProjectID:   projectID,
+		Title:       title,
 		Description: description,
-		Status:     StatusBacklog,
-		Priority:   priority,
-		BranchType: branchType,
-		Labels:     []string{},
-		CreatedBy:  createdBy,
-		CreatedAt:  now,
-		UpdatedAt:  now,
+		Status:      StatusBacklog,
+		Priority:    priority,
+		BranchType:  branchType,
+		Labels:      []string{},
+		CreatedBy:   createdBy,
+		CreatedAt:   now,
+		UpdatedAt:   now,
 	}
 }
 
@@ -99,7 +103,7 @@ func (t *Task) TransitionTo(target Status) error {
 	switch target {
 	case StatusInProgress:
 		t.StartedAt = &now
-	case StatusDone:
+	case StatusMerged:
 		t.CompletedAt = &now
 	}
 

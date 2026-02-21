@@ -6,28 +6,22 @@ import (
 	"github.com/google/uuid"
 )
 
+// ThreadType is simplified to task only. Other thread types are V3+ concerns.
 type ThreadType string
 
 const (
-	TypeTask         ThreadType = "task"
-	TypeGeneral      ThreadType = "general"
-	TypeTaskBoard    ThreadType = "task_board"
-	TypePRMerging    ThreadType = "pr_merging"
-	TypeBlockers     ThreadType = "blockers"
-	TypeArchDecision ThreadType = "arch_decision"
-	TypeEscalation   ThreadType = "escalation"
+	TypeTask ThreadType = "task"
 )
 
+// PostType covers the five meaningful communication patterns between agents.
 type PostType string
 
 const (
-	PostProgress   PostType = "progress"
-	PostBlocker    PostType = "blocker"
-	PostHelpWanted PostType = "help_wanted"
-	PostDecision   PostType = "decision"
-	PostArtifact   PostType = "artifact"
-	PostReviewReq  PostType = "review_req"
-	PostComment    PostType = "comment"
+	PostProgress       PostType = "progress"
+	PostReviewFeedback PostType = "review_feedback"
+	PostBlocker        PostType = "blocker"
+	PostArtifact       PostType = "artifact"
+	PostComment        PostType = "comment"
 )
 
 type Thread struct {
@@ -70,11 +64,6 @@ func NewMessage(threadID uuid.UUID, agentID *uuid.UUID, postType PostType, conte
 		Metadata:  map[string]interface{}{},
 		CreatedAt: time.Now().UTC(),
 	}
-}
-
-type Visibility struct {
-	ThreadID  uuid.UUID `json:"thread_id"`
-	AgentRole string    `json:"agent_role"`
 }
 
 type ListFilters struct {

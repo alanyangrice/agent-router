@@ -11,51 +11,8 @@ import (
 )
 
 func Register(rg *gin.RouterGroup, svc *agentsvc.Service) {
-	rg.POST("/register", registerAgent(svc))
-	rg.POST("/:id/heartbeat", heartbeat(svc))
 	rg.GET("/", listAgents(svc))
 	rg.GET("/:id", getAgent(svc))
-}
-
-type registerReq struct {
-	ProjectID uuid.UUID `json:"project_id" binding:"required"`
-	Role      string    `json:"role" binding:"required"`
-	Name      string    `json:"name" binding:"required"`
-	Model     string    `json:"model" binding:"required"`
-	Skills    []string  `json:"skills"`
-}
-
-func registerAgent(svc *agentsvc.Service) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		var req registerReq
-		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-			return
-		}
-
-		a, err := svc.Register(c.Request.Context(), req.ProjectID, req.Role, req.Name, req.Model, req.Skills)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
-		c.JSON(http.StatusCreated, a)
-	}
-}
-
-func heartbeat(svc *agentsvc.Service) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		id, err := uuid.Parse(c.Param("id"))
-		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid id"})
-			return
-		}
-
-		if err := svc.Heartbeat(c.Request.Context(), id); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
-	}
 }
 
 func listAgents(svc *agentsvc.Service) gin.HandlerFunc {

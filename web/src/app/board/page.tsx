@@ -8,11 +8,12 @@ import { TaskCard } from "@/components/TaskCard";
 import { TaskDetailPanel } from "@/components/TaskDetailPanel";
 
 const COLUMNS: { key: Task["status"]; label: string; color: string }[] = [
-  { key: "backlog", label: "Backlog", color: "bg-gray-500" },
-  { key: "ready", label: "Ready", color: "bg-purple-500" },
-  { key: "in_progress", label: "In Progress", color: "bg-blue-500" },
-  { key: "in_review", label: "In Review", color: "bg-yellow-500" },
-  { key: "done", label: "Done", color: "bg-green-500" },
+  { key: "backlog",     label: "Backlog",      color: "bg-gray-500" },
+  { key: "ready",       label: "Ready",        color: "bg-purple-500" },
+  { key: "in_progress", label: "In Progress",  color: "bg-blue-500" },
+  { key: "in_qa",       label: "QA",           color: "bg-orange-500" },
+  { key: "in_review",   label: "Code Review",  color: "bg-yellow-500" },
+  { key: "merged",      label: "Merged",       color: "bg-green-500" },
 ];
 
 export default function BoardPage() {
@@ -85,15 +86,13 @@ export default function BoardPage() {
           <div className="h-8 w-8 animate-spin rounded-full border-2 border-gray-600 border-t-blue-500" />
         </div>
       ) : (
-        <div className="grid grid-cols-5 gap-4">
+        <div className="grid grid-cols-6 gap-3">
           {COLUMNS.map((col) => {
             const colTasks = tasksByStatus(col.key);
             return (
               <div key={col.key} className="flex flex-col">
                 <div className="mb-3 flex items-center gap-2">
-                  <span
-                    className={`h-2.5 w-2.5 rounded-full ${col.color}`}
-                  />
+                  <span className={`h-2.5 w-2.5 rounded-full ${col.color}`} />
                   <h2 className="text-sm font-medium text-gray-300">
                     {col.label}
                   </h2>
@@ -115,6 +114,11 @@ export default function BoardPage() {
                         agentName={
                           task.assigned_agent_id
                             ? agentMap.get(task.assigned_agent_id)?.name
+                            : undefined
+                        }
+                        agentRole={
+                          task.assigned_agent_id
+                            ? agentMap.get(task.assigned_agent_id)?.role
                             : undefined
                         }
                         onClick={() => setSelectedTask(task)}
@@ -214,17 +218,15 @@ function CreateTaskForm({
           <textarea
             value={description}
             onChange={(e) => setDescription(e.target.value)}
-            placeholder="Details, acceptance criteria, context..."
-            rows={3}
+            placeholder="Details, acceptance criteria, context for the agent..."
+            rows={4}
             className="w-full rounded-lg border border-gray-700 bg-gray-900 px-3 py-2 text-sm text-white placeholder-gray-500 outline-none focus:border-blue-500"
           />
         </div>
 
         <div className="grid grid-cols-2 gap-4">
           <div>
-            <label className="mb-1 block text-sm text-gray-400">
-              Priority
-            </label>
+            <label className="mb-1 block text-sm text-gray-400">Priority</label>
             <select
               value={priority}
               onChange={(e) => setPriority(e.target.value)}
@@ -238,9 +240,7 @@ function CreateTaskForm({
           </div>
 
           <div>
-            <label className="mb-1 block text-sm text-gray-400">
-              Branch Type
-            </label>
+            <label className="mb-1 block text-sm text-gray-400">Branch Type</label>
             <select
               value={branchType}
               onChange={(e) => setBranchType(e.target.value)}
