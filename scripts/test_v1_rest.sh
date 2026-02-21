@@ -2,7 +2,7 @@
 # V1 REST API smoke test
 # Usage: BASE_URL=http://localhost:8080 bash scripts/test_v1_rest.sh
 # Requires: curl, jq
-set -euo pipefail
+set -uo pipefail
 
 BASE="${BASE_URL:-http://localhost:8080}"
 PASS=0
@@ -12,12 +12,12 @@ assert() {
   local desc="$1" actual="$2" expected="$3"
   if [ "$actual" = "$expected" ]; then
     echo "  PASS $desc"
-    ((PASS++))
+    PASS=$((PASS + 1))
   else
     echo "  FAIL $desc"
     echo "       got:  $actual"
     echo "       want: $expected"
-    ((FAIL++))
+    FAIL=$((FAIL + 1))
   fi
 }
 
@@ -25,10 +25,10 @@ assert_notempty() {
   local desc="$1" actual="$2"
   if [ -n "$actual" ] && [ "$actual" != "null" ]; then
     echo "  PASS $desc"
-    ((PASS++))
+    PASS=$((PASS + 1))
   else
     echo "  FAIL $desc (empty or null)"
-    ((FAIL++))
+    FAIL=$((FAIL + 1))
   fi
 }
 
@@ -39,7 +39,7 @@ echo ""
 
 # ── Projects ──────────────────────────────────────────────────────────────────
 echo "--- Projects ---"
-PROJECT=$(curl -sf -X POST "$BASE/api/projects" \
+PROJECT=$(curl -sf -X POST "$BASE/api/projects/" \
   -H "Content-Type: application/json" \
   -d '{"name":"smoke-test","repo_url":"https://github.com/test/repo"}')
 PROJECT_ID=$(echo "$PROJECT" | jq -r .id)
@@ -52,7 +52,7 @@ assert "get project" "$(echo "$GET_PROJECT" | jq -r .id)" "$PROJECT_ID"
 # ── Tasks ─────────────────────────────────────────────────────────────────────
 echo ""
 echo "--- Tasks ---"
-TASK=$(curl -sf -X POST "$BASE/api/tasks" \
+TASK=$(curl -sf -X POST "$BASE/api/tasks/" \
   -H "Content-Type: application/json" \
   -d "{\"project_id\":\"$PROJECT_ID\",\"title\":\"Add login endpoint\",
        \"description\":\"Implement POST /auth/login returning a JWT\",
@@ -72,31 +72,21 @@ curl -sf -X PATCH "$BASE/api/tasks/$TASK_ID" \
 assert "move task to ready" "$(curl -sf "$BASE/api/tasks/$TASK_ID" | jq -r .status)" "ready"
 
 # List tasks
-LIST=$(curl -sf "$BASE/api/tasks?project_id=$PROJECT_ID")
+LIST=$(curl -sf "$BASE/api/tasks/?project_id=$PROJECT_ID")
 assert "list tasks: count" "$(echo "$LIST" | jq 'length')" "1"
 assert "list tasks: status" "$(echo "$LIST" | jq -r '.[0].status')" "ready"
 
 # ── Agents ────────────────────────────────────────────────────────────────────
+# Note: agents register via MCP (not REST). The REST API is read-only for agents.
 echo ""
 echo "--- Agents ---"
-AGENT=$(curl -sf -X POST "$BASE/api/agents/register" \
-  -H "Content-Type: application/json" \
-  -d "{\"project_id\":\"$PROJECT_ID\",\"role\":\"coder\",
-       \"name\":\"test-coder\",\"model\":\"stub\"}")
-AGENT_ID=$(echo "$AGENT" | jq -r .id)
-assert "register agent: role" "$(echo "$AGENT" | jq -r .role)" "coder"
-assert_notempty "register agent: id" "$AGENT_ID"
-
-AGENTS=$(curl -sf "$BASE/api/agents?project_id=$PROJECT_ID")
-assert "list agents: count" "$(echo "$AGENTS" | jq 'length')" "1"
-
-GET_AGENT=$(curl -sf "$BASE/api/agents/$AGENT_ID")
-assert "get agent: role" "$(echo "$GET_AGENT" | jq -r .role)" "coder"
+AGENTS=$(curl -sf "$BASE/api/agents/?project_id=$PROJECT_ID")
+assert "list agents: returns array" "$(echo "$AGENTS" | jq -r 'type')" "array"
 
 # ── Threads ───────────────────────────────────────────────────────────────────
 echo ""
 echo "--- Threads ---"
-THREAD_LIST=$(curl -sf "$BASE/api/threads?task_id=$TASK_ID")
+THREAD_LIST=$(curl -sf "$BASE/api/threads/?task_id=$TASK_ID")
 assert "auto-created task thread" "$(echo "$THREAD_LIST" | jq 'length')" "1"
 THREAD_ID=$(echo "$THREAD_LIST" | jq -r '.[0].id')
 assert_notempty "thread id" "$THREAD_ID"
@@ -104,8 +94,7 @@ assert "thread type" "$(echo "$THREAD_LIST" | jq -r '.[0].type')" "task"
 
 MSG=$(curl -sf -X POST "$BASE/api/threads/$THREAD_ID/messages" \
   -H "Content-Type: application/json" \
-  -d "{\"agent_id\":\"$AGENT_ID\",\"post_type\":\"progress\",
-       \"content\":\"Starting implementation of login endpoint\"}")
+  -d '{"post_type":"progress","content":"Starting implementation of login endpoint"}')
 MSG_ID=$(echo "$MSG" | jq -r .id)
 assert "post message: post_type" "$(echo "$MSG" | jq -r .post_type)" "progress"
 assert_notempty "post message: id" "$MSG_ID"
@@ -156,7 +145,7 @@ assert "in_review → merged" "$(curl -sf "$BASE/api/tasks/$TASK_ID" | jq -r .st
 # ── Dependencies ──────────────────────────────────────────────────────────────
 echo ""
 echo "--- Dependencies ---"
-TASK2=$(curl -sf -X POST "$BASE/api/tasks" \
+TASK2=$(curl -sf -X POST "$BASE/api/tasks/" \
   -H "Content-Type: application/json" \
   -d "{\"project_id\":\"$PROJECT_ID\",\"title\":\"Write tests\",
        \"description\":\"Add unit tests for login\",\"priority\":\"medium\",

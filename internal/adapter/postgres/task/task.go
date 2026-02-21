@@ -32,7 +32,7 @@ func (r *Repository) Create(ctx context.Context, t domaintask.Task) (domaintask.
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
 		RETURNING id, project_id, title, description, status, priority,
 			assigned_agent_id, parent_task_id, branch_type, branch_name,
-			labels, required_role, pr_url, created_by, created_at, updated_at, started_at, completed_at`
+			labels, COALESCE(required_role,''), COALESCE(pr_url,''), created_by, created_at, updated_at, started_at, completed_at`
 
 	var created domaintask.Task
 	err := r.pool.QueryRow(ctx, query,
@@ -57,7 +57,7 @@ func (r *Repository) GetByID(ctx context.Context, id uuid.UUID) (domaintask.Task
 	query := `
 		SELECT id, project_id, title, description, status, priority,
 			assigned_agent_id, parent_task_id, branch_type, branch_name,
-			labels, required_role, pr_url, created_by, created_at, updated_at, started_at, completed_at
+			labels, COALESCE(required_role,''), COALESCE(pr_url,''), created_by, created_at, updated_at, started_at, completed_at
 		FROM tasks WHERE id = $1`
 
 	var t domaintask.Task
@@ -80,7 +80,7 @@ func (r *Repository) List(ctx context.Context, filters domaintask.ListFilters) (
 	query := `
 		SELECT id, project_id, title, description, status, priority,
 			assigned_agent_id, parent_task_id, branch_type, branch_name,
-			labels, required_role, pr_url, created_by, created_at, updated_at, started_at, completed_at
+			labels, COALESCE(required_role,''), COALESCE(pr_url,''), created_by, created_at, updated_at, started_at, completed_at
 		FROM tasks WHERE 1=1`
 
 	args := []interface{}{}
@@ -213,7 +213,7 @@ func (r *Repository) GetDependencies(ctx context.Context, taskID uuid.UUID) ([]d
 	query := `
 		SELECT t.id, t.project_id, t.title, t.description, t.status, t.priority,
 			t.assigned_agent_id, t.parent_task_id, t.branch_type, t.branch_name,
-			t.labels, t.required_role, t.pr_url, t.created_by, t.created_at, t.updated_at, t.started_at, t.completed_at
+			t.labels, COALESCE(t.required_role,''), COALESCE(t.pr_url,''), t.created_by, t.created_at, t.updated_at, t.started_at, t.completed_at
 		FROM tasks t
 		JOIN task_dependencies td ON td.depends_on_id = t.id
 		WHERE td.task_id = $1
