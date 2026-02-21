@@ -41,7 +41,7 @@ func Build(ctx context.Context) (*App, error) {
 	// ── Database ────────────────────────────────────────────────────────
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		dbURL = "postgres://agentmesh:agentmesh@localhost:5432/agentmesh?sslmode=disable"
+		return nil, fmt.Errorf("no dbURL set")
 	}
 	pool, err := pgdb.Connect(ctx, dbURL)
 	if err != nil {

@@ -22,22 +22,6 @@ import (
 	wshandler "github.com/alanyang/agent-mesh/internal/transport/ws"
 )
 
-// broadcastedEvents are the event types forwarded to WebSocket clients.
-// AgentHeartbeat is intentionally excluded — it fires every 30s per agent and
-// carries no actionable information for browser or agent subscribers.
-var broadcastedEvents = []event.Type{
-	event.TypeTaskCreated,
-	event.TypeTaskUpdated,
-	event.TypeTaskAssigned,
-	event.TypeTaskCompleted,
-	event.TypeThreadMessage,
-	event.TypeAgentOnline,
-	event.TypeAgentOffline,
-	event.TypePROpened,
-	event.TypePRMerged,
-	event.TypeReviewPosted,
-}
-
 func NewRouter(
 	ctx context.Context,
 	taskSvc *tasksvc.Service,
@@ -66,13 +50,24 @@ func NewRouter(
 	hub := wshandler.NewHub()
 	hub.Register(api.Group("/ws"))
 
-	// Bridge: subscribe to backend events and broadcast to all WS clients.
-	for _, topic := range broadcastedEvents {
-		t := topic
-		if _, err := eventBus.Subscribe(ctx, t, func(_ context.Context, e event.Event) {
+	// Bridge: one subscription per domain channel (4 total Postgres connections).
+	// All events within a channel are forwarded to WS clients; event.Type in the
+	// payload lets the client filter. AgentHeartbeat is excluded — it is in the
+	// agent channel but carries no actionable state for browsers or agents.
+	for _, ch := range []event.Channel{
+		event.ChannelTask,
+		event.ChannelAgent,
+		event.ChannelThread,
+		event.ChannelGit,
+	} {
+		c := ch
+		if _, err := eventBus.Subscribe(ctx, c, func(_ context.Context, e event.Event) {
+			if e.Type == event.TypeAgentHeartbeat {
+				return
+			}
 			hub.Broadcast(e)
 		}); err != nil {
-			slog.Error("failed to subscribe event to WS hub", "topic", t, "error", err)
+			slog.Error("failed to subscribe channel to WS hub", "channel", c, "error", err)
 		}
 	}
 
