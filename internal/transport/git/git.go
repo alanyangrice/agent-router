@@ -17,6 +17,12 @@ func Register(rg *gin.RouterGroup, svc *gitsvc.Service) {
 	rg.GET("/pr/:id/diff", getDiff(svc))
 }
 
+func gitUnavailable(c *gin.Context) {
+	c.JSON(http.StatusServiceUnavailable, gin.H{
+		"error": "GitHub integration not configured (GITHUB_TOKEN, GITHUB_OWNER, GITHUB_REPO must be set)",
+	})
+}
+
 type openPRReq struct {
 	Title string `json:"title" binding:"required"`
 	Body  string `json:"body"`
@@ -26,6 +32,10 @@ type openPRReq struct {
 
 func openPR(svc *gitsvc.Service) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if svc == nil {
+			gitUnavailable(c)
+			return
+		}
 		var req openPRReq
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -52,6 +62,10 @@ func parsePRNumber(c *gin.Context) (int, bool) {
 
 func mergePR(svc *gitsvc.Service) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if svc == nil {
+			gitUnavailable(c)
+			return
+		}
 		n, ok := parsePRNumber(c)
 		if !ok {
 			return
@@ -73,6 +87,10 @@ type postCommentReq struct {
 
 func postComment(svc *gitsvc.Service) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if svc == nil {
+			gitUnavailable(c)
+			return
+		}
 		n, ok := parsePRNumber(c)
 		if !ok {
 			return
@@ -95,6 +113,10 @@ func postComment(svc *gitsvc.Service) gin.HandlerFunc {
 
 func getDiff(svc *gitsvc.Service) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if svc == nil {
+			gitUnavailable(c)
+			return
+		}
 		n, ok := parsePRNumber(c)
 		if !ok {
 			return

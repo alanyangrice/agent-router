@@ -43,21 +43,20 @@ class ExampleAgent(BaseAgent):
         self.repo_path = repo_path
 
     def run(self):
-        logger.info("Example agent running, polling for tasks...")
+        logger.info("Example agent running, polling for assigned tasks...")
 
         while self._running:
             try:
-                tasks = self.client.list_tasks(
-                    self.project_id, status=TaskStatus.IN_PROGRESS
-                )
+                # Poll for ready tasks assigned to this agent by the distributor.
+                # The agent owns the ready → in_progress transition when it begins work.
+                assigned_tasks = self.get_assigned_tasks()
 
-                my_tasks = [t for t in tasks if t.assigned_agent_id == self.agent_id]
-
-                if not my_tasks:
+                if not assigned_tasks:
                     time.sleep(5)
                     continue
 
-                for task in my_tasks:
+                for task in assigned_tasks:
+                    self.client.update_task_status(task.id, TaskStatus.READY, TaskStatus.IN_PROGRESS)
                     self._work_on_task(task)
 
             except KeyboardInterrupt:

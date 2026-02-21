@@ -187,6 +187,19 @@ func (r *Repository) Unassign(ctx context.Context, taskID uuid.UUID) error {
 	return nil
 }
 
+func (r *Repository) UnassignByAgent(ctx context.Context, agentID uuid.UUID) error {
+	query := `
+		UPDATE tasks
+		SET assigned_agent_id = NULL, updated_at = NOW()
+		WHERE assigned_agent_id = $1 AND status = 'ready'`
+
+	_, err := r.pool.Exec(ctx, query, agentID)
+	if err != nil {
+		return fmt.Errorf("unassigning ready tasks for agent %s: %w", agentID, err)
+	}
+	return nil
+}
+
 func (r *Repository) AddDependency(ctx context.Context, dep domaintask.Dependency) error {
 	query := `INSERT INTO task_dependencies (task_id, depends_on_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`
 
@@ -235,6 +248,7 @@ func (r *Repository) GetReadyTasks(ctx context.Context, projectID uuid.UUID, ski
 		FROM tasks t
 		WHERE t.project_id = $1
 		  AND t.status = 'ready'
+		  AND t.assigned_agent_id IS NULL
 		  AND NOT EXISTS (
 			SELECT 1 FROM task_dependencies td
 			JOIN tasks dep ON dep.id = td.depends_on_id

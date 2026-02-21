@@ -70,3 +70,6 @@ migrations/          SQL migration files
 - **Frontend:** Next.js, React, TypeScript
 - **Agents:** Python
 - **Real-time:** WebSocket + Postgres LISTEN/NOTIFY
+
+
+<!-- Task: Test1 (ID: 3c462e9e-19cc-4904-a5f7-c98cc390abd2) -->

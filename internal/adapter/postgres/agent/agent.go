@@ -200,6 +200,7 @@ func (r *Repository) GetStale(ctx context.Context, thresholdSeconds int) ([]doma
 			current_task_id, config_jsonb, stats_jsonb, last_heartbeat_at, created_at
 		FROM agents
 		WHERE last_heartbeat_at < NOW() - make_interval(secs => $1)
+		  AND status != 'offline'
 		ORDER BY last_heartbeat_at ASC`
 
 	rows, err := r.pool.Query(ctx, query, thresholdSeconds)

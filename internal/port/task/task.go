@@ -19,6 +19,9 @@ type Repository interface {
 
 	Assign(ctx context.Context, taskID, agentID uuid.UUID) error
 	Unassign(ctx context.Context, taskID uuid.UUID) error
+	// UnassignByAgent clears assigned_agent_id for all ready tasks owned by the given agent.
+	// Used by the reaper to release tasks when an agent goes offline before starting work.
+	UnassignByAgent(ctx context.Context, agentID uuid.UUID) error
 
 	AddDependency(ctx context.Context, dep domaintask.Dependency) error
 	RemoveDependency(ctx context.Context, taskID, dependsOnID uuid.UUID) error
