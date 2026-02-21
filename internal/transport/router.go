@@ -1,9 +1,13 @@
 package transport
 
 import (
+	"context"
+	"log/slog"
+
 	"github.com/gin-gonic/gin"
 
-	"github.com/alanyang/agent-mesh/internal/port/eventbus"
+	"github.com/alanyang/agent-mesh/internal/domain/event"
+	porteventbus "github.com/alanyang/agent-mesh/internal/port/eventbus"
 	agentsvc "github.com/alanyang/agent-mesh/internal/service/agent"
 	gitsvc "github.com/alanyang/agent-mesh/internal/service/git"
 	projectsvc "github.com/alanyang/agent-mesh/internal/service/project"
@@ -19,12 +23,13 @@ import (
 )
 
 func NewRouter(
+	ctx context.Context,
 	taskSvc *tasksvc.Service,
 	threadSvc *threadsvc.Service,
 	agentSvc *agentsvc.Service,
 	gitSvc *gitsvc.Service,
 	projectSvc *projectsvc.Service,
-	_ eventbus.EventBus,
+	eventBus porteventbus.EventBus,
 ) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
@@ -44,6 +49,27 @@ func NewRouter(
 
 	hub := wshandler.NewHub()
 	hub.Register(api.Group("/ws"))
+
+	// Bridge: one subscription per domain channel (4 total Postgres connections).
+	// All events within a channel are forwarded to WS clients; event.Type in the
+	// payload lets the client filter. AgentHeartbeat is excluded — it is in the
+	// agent channel but carries no actionable state for browsers or agents.
+	for _, ch := range []event.Channel{
+		event.ChannelTask,
+		event.ChannelAgent,
+		event.ChannelThread,
+		event.ChannelGit,
+	} {
+		c := ch
+		if _, err := eventBus.Subscribe(ctx, c, func(_ context.Context, e event.Event) {
+			if e.Type == event.TypeAgentHeartbeat {
+				return
+			}
+			hub.Broadcast(e)
+		}); err != nil {
+			slog.Error("failed to subscribe channel to WS hub", "channel", c, "error", err)
+		}
+	}
 
 	return r
 }

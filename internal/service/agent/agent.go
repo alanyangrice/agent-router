@@ -13,6 +13,7 @@ import (
 	domaintask "github.com/alanyang/agent-mesh/internal/domain/task"
 	portagent "github.com/alanyang/agent-mesh/internal/port/agent"
 	portbus "github.com/alanyang/agent-mesh/internal/port/eventbus"
+	portdist "github.com/alanyang/agent-mesh/internal/port/distributor"
 	porttask "github.com/alanyang/agent-mesh/internal/port/task"
 )
 
@@ -20,10 +21,11 @@ type Service struct {
 	repo     portagent.Repository
 	taskRepo porttask.Repository
 	bus      portbus.EventBus
+	dist     portdist.Distributor
 }
 
-func NewService(repo portagent.Repository, taskRepo porttask.Repository, bus portbus.EventBus) *Service {
-	return &Service{repo: repo, taskRepo: taskRepo, bus: bus}
+func NewService(repo portagent.Repository, taskRepo porttask.Repository, bus portbus.EventBus, dist portdist.Distributor) *Service {
+	return &Service{repo: repo, taskRepo: taskRepo, bus: bus, dist: dist}
 }
 
 func (s *Service) Register(ctx context.Context, projectID uuid.UUID, role, name, model string, skills []string) (domainagent.Agent, error) {
@@ -58,12 +60,36 @@ func (s *Service) List(ctx context.Context, filters domainagent.ListFilters) ([]
 }
 
 func (s *Service) Heartbeat(ctx context.Context, id uuid.UUID) error {
+	a, err := s.repo.GetByID(ctx, id)
+	if err != nil {
+		return fmt.Errorf("get agent for heartbeat: %w", err)
+	}
+
 	if err := s.repo.UpdateHeartbeat(ctx, id); err != nil {
 		return fmt.Errorf("update heartbeat: %w", err)
 	}
 
 	if err := s.bus.Publish(ctx, event.New(event.TypeAgentHeartbeat, id)); err != nil {
 		slog.ErrorContext(ctx, "failed to publish AgentHeartbeat event", "agent_id", id, "error", err)
+	}
+
+	// If idle, ask the distributor to assign any pending ready tasks.
+	// The assigned agent will poll for its ready tasks and own the status transition.
+	if a.Status == domainagent.StatusIdle {
+		go func() {
+			bgCtx := context.WithoutCancel(ctx)
+			assignments, err := s.dist.Rebalance(bgCtx, a.ProjectID)
+			if err != nil {
+				slog.ErrorContext(bgCtx, "heartbeat: rebalance failed", "agent_id", id, "error", err)
+				return
+			}
+			for _, assignment := range assignments {
+				if err := s.bus.Publish(bgCtx, event.New(event.TypeTaskAssigned, assignment.TaskID)); err != nil {
+					slog.ErrorContext(bgCtx, "heartbeat: failed to publish TaskAssigned", "task_id", assignment.TaskID, "error", err)
+				}
+				slog.InfoContext(bgCtx, "heartbeat: rebalanced task to agent", "task_id", assignment.TaskID, "agent_id", assignment.AgentID)
+			}
+		}()
 	}
 
 	return nil

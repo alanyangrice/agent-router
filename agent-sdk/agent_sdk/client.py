@@ -28,10 +28,17 @@ class AgentMeshClient:
 
     # Tasks
 
-    def list_tasks(self, project_id: UUID, status: Optional[TaskStatus] = None) -> list[Task]:
+    def list_tasks(
+        self,
+        project_id: UUID,
+        status: Optional[TaskStatus] = None,
+        assigned_to: Optional[UUID] = None,
+    ) -> list[Task]:
         params: dict[str, str] = {"project_id": str(project_id)}
         if status:
             params["status"] = status.value
+        if assigned_to:
+            params["assigned_to"] = str(assigned_to)
         resp = self._http.get("/api/tasks/", params=params)
         resp.raise_for_status()
         return [Task(**t) for t in resp.json()]

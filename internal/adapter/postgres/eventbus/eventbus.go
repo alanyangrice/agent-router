@@ -16,24 +16,24 @@ type EventBus struct {
 	pool *pgxpool.Pool
 
 	mu   sync.RWMutex
-	subs map[event.Type]map[*subscription]struct{}
+	subs map[event.Channel]map[*subscription]struct{}
 }
 
 func New(pool *pgxpool.Pool) *EventBus {
 	return &EventBus{
 		pool: pool,
-		subs: make(map[event.Type]map[*subscription]struct{}),
+		subs: make(map[event.Channel]map[*subscription]struct{}),
 	}
 }
 
-// Publish sends an event via Postgres NOTIFY on a channel named after the event type.
+// Publish sends an event via Postgres NOTIFY on the domain channel for the event type.
 func (eb *EventBus) Publish(ctx context.Context, e event.Event) error {
 	payload, err := json.Marshal(e)
 	if err != nil {
 		return fmt.Errorf("marshaling event: %w", err)
 	}
 
-	channel := channelName(e.Type)
+	channel := channelName(event.ChannelFor(e.Type))
 	_, err = eb.pool.Exec(ctx, "SELECT pg_notify($1, $2)", channel, string(payload))
 	if err != nil {
 		return fmt.Errorf("publishing event on channel %s: %w", channel, err)
@@ -41,15 +41,15 @@ func (eb *EventBus) Publish(ctx context.Context, e event.Event) error {
 	return nil
 }
 
-// Subscribe starts a background goroutine that LISTENs on the Postgres channel
-// for the given event type and invokes handler for each received event.
-func (eb *EventBus) Subscribe(ctx context.Context, topic event.Type, handler porteventbus.Handler) (porteventbus.Subscription, error) {
+// Subscribe starts a background goroutine that LISTENs on the domain Postgres channel
+// and invokes handler for every event published to that channel.
+func (eb *EventBus) Subscribe(ctx context.Context, ch event.Channel, handler porteventbus.Handler) (porteventbus.Subscription, error) {
 	conn, err := eb.pool.Acquire(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("acquiring connection for LISTEN: %w", err)
 	}
 
-	channel := channelName(topic)
+	channel := channelName(ch)
 	_, err = conn.Exec(ctx, "LISTEN "+channel)
 	if err != nil {
 		conn.Release()
@@ -65,10 +65,10 @@ func (eb *EventBus) Subscribe(ctx context.Context, topic event.Type, handler por
 	sub.cancel = cancel
 
 	eb.mu.Lock()
-	if eb.subs[topic] == nil {
-		eb.subs[topic] = make(map[*subscription]struct{})
+	if eb.subs[ch] == nil {
+		eb.subs[ch] = make(map[*subscription]struct{})
 	}
-	eb.subs[topic][sub] = struct{}{}
+	eb.subs[ch][sub] = struct{}{}
 	eb.mu.Unlock()
 
 	go func() {
@@ -99,17 +99,9 @@ func (eb *EventBus) Subscribe(ctx context.Context, topic event.Type, handler por
 	return sub, nil
 }
 
-func (eb *EventBus) removeSub(topic event.Type, sub *subscription) {
-	eb.mu.Lock()
-	defer eb.mu.Unlock()
-	if topicSubs, ok := eb.subs[topic]; ok {
-		delete(topicSubs, sub)
-	}
-}
-
-// channelName converts an event.Type to a safe Postgres channel identifier.
-func channelName(t event.Type) string {
-	return "agent_mesh_" + string(t)
+// channelName converts a domain Channel to a safe Postgres channel identifier.
+func channelName(ch event.Channel) string {
+	return "agent_mesh_" + string(ch)
 }
 
 type subscription struct {

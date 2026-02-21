@@ -22,6 +22,34 @@ const (
 	TypeReviewPosted   Type = "review_posted"
 )
 
+// Channel is a domain-scoped Postgres NOTIFY channel.
+// All event types within a domain share one LISTEN connection.
+type Channel string
+
+const (
+	ChannelTask   Channel = "task"
+	ChannelAgent  Channel = "agent"
+	ChannelThread Channel = "thread"
+	ChannelGit    Channel = "git"
+)
+
+var typeToChannel = map[Type]Channel{
+	TypeTaskCreated:    ChannelTask,
+	TypeTaskUpdated:    ChannelTask,
+	TypeTaskAssigned:   ChannelTask,
+	TypeTaskCompleted:  ChannelTask,
+	TypeAgentOnline:    ChannelAgent,
+	TypeAgentOffline:   ChannelAgent,
+	TypeAgentHeartbeat: ChannelAgent,
+	TypeThreadMessage:  ChannelThread,
+	TypePROpened:       ChannelGit,
+	TypePRMerged:       ChannelGit,
+	TypeReviewPosted:   ChannelGit,
+}
+
+// ChannelFor returns the domain channel for a given event type.
+func ChannelFor(t Type) Channel { return typeToChannel[t] }
+
 // Event carries identifiers only, not full state.
 // Subscribers fetch fresh state from the appropriate repository.
 type Event struct {

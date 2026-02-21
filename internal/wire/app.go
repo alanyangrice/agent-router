@@ -41,7 +41,7 @@ func Build(ctx context.Context) (*App, error) {
 	// ── Database ────────────────────────────────────────────────────────
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		dbURL = "postgres://agentmesh:agentmesh@localhost:5432/agentmesh?sslmode=disable"
+		return nil, fmt.Errorf("no dbURL set")
 	}
 	pool, err := pgdb.Connect(ctx, dbURL)
 	if err != nil {
@@ -67,7 +67,7 @@ func Build(ctx context.Context) (*App, error) {
 	distSvc := distsvc.NewService(taskRepo, agentRepo)
 	taskSvc := tasksvc.NewService(taskRepo, eventBus, distSvc, threadRepo)
 	threadSvc := threadsvc.NewService(threadRepo, eventBus)
-	agentSvc := agentsvc.NewService(agentRepo, taskRepo, eventBus)
+	agentSvc := agentsvc.NewService(agentRepo, taskRepo, eventBus, distSvc)
 
 	var gitSvcInstance *gitsvc.Service
 	if gitProvider != nil {
@@ -78,7 +78,7 @@ func Build(ctx context.Context) (*App, error) {
 	projectSvcInstance := projectsvc.NewService(projectRepo)
 
 	// ── Transport ───────────────────────────────────────────────────────
-	router := transport.NewRouter(taskSvc, threadSvc, agentSvc, gitSvcInstance, projectSvcInstance, eventBus)
+	router := transport.NewRouter(ctx, taskSvc, threadSvc, agentSvc, gitSvcInstance, projectSvcInstance, eventBus)
 
 	port := os.Getenv("PORT")
 	if port == "" {

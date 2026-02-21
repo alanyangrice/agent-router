@@ -141,7 +141,15 @@ func (r *Repository) Update(ctx context.Context, t domaintask.Task) error {
 }
 
 func (r *Repository) UpdateStatus(ctx context.Context, id uuid.UUID, from, to domaintask.Status) error {
-	query := `UPDATE tasks SET status = $1, updated_at = NOW() WHERE id = $2 AND status = $3`
+	var query string
+	switch to {
+	case domaintask.StatusInProgress:
+		query = `UPDATE tasks SET status = $1, updated_at = NOW(), started_at = NOW() WHERE id = $2 AND status = $3`
+	case domaintask.StatusDone:
+		query = `UPDATE tasks SET status = $1, updated_at = NOW(), completed_at = NOW() WHERE id = $2 AND status = $3`
+	default:
+		query = `UPDATE tasks SET status = $1, updated_at = NOW() WHERE id = $2 AND status = $3`
+	}
 
 	tag, err := r.pool.Exec(ctx, query, string(to), id, string(from))
 	if err != nil {

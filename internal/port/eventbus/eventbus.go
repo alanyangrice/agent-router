@@ -14,5 +14,5 @@ type Subscription interface {
 
 type EventBus interface {
 	Publish(ctx context.Context, e event.Event) error
-	Subscribe(ctx context.Context, topic event.Type, handler Handler) (Subscription, error)
+	Subscribe(ctx context.Context, ch event.Channel, handler Handler) (Subscription, error)
 }

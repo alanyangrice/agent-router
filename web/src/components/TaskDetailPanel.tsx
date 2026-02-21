@@ -63,9 +63,13 @@ export function TaskDetailPanel({
             <h2 className="text-base font-semibold text-white leading-snug">
               {task.title}
             </h2>
-            <p className="mt-0.5 text-xs text-gray-500 font-mono">
-              {task.id.slice(0, 8)}
-            </p>
+            <button
+              className="mt-0.5 text-xs text-gray-500 font-mono hover:text-gray-300 transition-colors cursor-copy"
+              title="Click to copy"
+              onClick={() => navigator.clipboard.writeText(task.id)}
+            >
+              {task.id}
+            </button>
           </div>
           <button
             onClick={onClose}

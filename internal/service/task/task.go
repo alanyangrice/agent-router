@@ -10,7 +10,7 @@ import (
 	"github.com/alanyang/agent-mesh/internal/domain/event"
 	domaintask "github.com/alanyang/agent-mesh/internal/domain/task"
 	domainthread "github.com/alanyang/agent-mesh/internal/domain/thread"
-	portagent "github.com/alanyang/agent-mesh/internal/port/distributor"
+	portdist "github.com/alanyang/agent-mesh/internal/port/distributor"
 	portbus "github.com/alanyang/agent-mesh/internal/port/eventbus"
 	porttask "github.com/alanyang/agent-mesh/internal/port/task"
 	portthread "github.com/alanyang/agent-mesh/internal/port/thread"
@@ -19,11 +19,11 @@ import (
 type Service struct {
 	repo       porttask.Repository
 	bus        portbus.EventBus
-	dist       portagent.Distributor
+	dist       portdist.Distributor
 	threadRepo portthread.Repository
 }
 
-func NewService(repo porttask.Repository, bus portbus.EventBus, dist portagent.Distributor, threadRepo portthread.Repository) *Service {
+func NewService(repo porttask.Repository, bus portbus.EventBus, dist portdist.Distributor, threadRepo portthread.Repository) *Service {
 	return &Service{repo: repo, bus: bus, dist: dist, threadRepo: threadRepo}
 }
 
@@ -79,6 +79,8 @@ func (s *Service) UpdateStatus(ctx context.Context, id uuid.UUID, from, to domai
 
 	switch to {
 	case domaintask.StatusReady:
+		// Distributor assigns an agent but does NOT move the task forward.
+		// The assigned agent owns the ready → in_progress transition when it begins work.
 		t, err := s.repo.GetByID(ctx, id)
 		if err != nil {
 			slog.ErrorContext(ctx, "failed to fetch task for auto-distribute", "task_id", id, "error", err)
