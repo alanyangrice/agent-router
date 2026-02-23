@@ -63,22 +63,26 @@ func TestPipeline_DefaultConfig_Transitions(t *testing.T) {
 	cfg := pipeline.DefaultConfig
 
 	tests := []struct {
-		status         domaintask.Status
-		expectRole     string
-		expectBroadcast string
+		status              domaintask.Status
+		expectAssignRole    string
+		expectFreedRole     string
+		expectBroadcast     string
+		expectBroadcastRole string
 	}{
-		{domaintask.StatusReady, "coder", ""},
-		{domaintask.StatusInProgress, "", ""},       // ownership lock: no new role
-		{domaintask.StatusInQA, "qa", ""},
-		{domaintask.StatusInReview, "reviewer", ""},
-		{domaintask.StatusMerged, "", "main_updated"},
+		{domaintask.StatusReady, "coder", "", "", ""},
+		{domaintask.StatusInProgress, "", "coder", "", ""},
+		{domaintask.StatusInQA, "qa", "qa", "", ""},
+		{domaintask.StatusInReview, "reviewer", "reviewer", "", ""},
+		{domaintask.StatusMerged, "", "", "main_updated", "coder"},
 	}
 
 	for _, tc := range tests {
 		action, ok := cfg[tc.status]
 		require.True(t, ok, "status %s should have a pipeline action", tc.status)
-		assert.Equal(t, tc.expectRole, action.AssignRole, "status %s AssignRole", tc.status)
+		assert.Equal(t, tc.expectAssignRole, action.AssignRole, "status %s AssignRole", tc.status)
+		assert.Equal(t, tc.expectFreedRole, action.FreedRole, "status %s FreedRole", tc.status)
 		assert.Equal(t, tc.expectBroadcast, action.BroadcastEvent, "status %s BroadcastEvent", tc.status)
+		assert.Equal(t, tc.expectBroadcastRole, action.BroadcastRole, "status %s BroadcastRole", tc.status)
 	}
 }
 

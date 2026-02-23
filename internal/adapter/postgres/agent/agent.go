@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	domainagent "github.com/alanyang/agent-mesh/internal/domain/agent"
+	"github.com/alanyang/agent-mesh/internal/service/distributor"
 )
 
 type Repository struct {
@@ -114,15 +115,82 @@ func (r *Repository) UpdateStatus(ctx context.Context, id uuid.UUID, status doma
 	return nil
 }
 
-func (r *Repository) SetCurrentTask(ctx context.Context, agentID uuid.UUID, taskID *uuid.UUID) error {
-	tag, err := r.pool.Exec(ctx, `UPDATE agents SET current_task_id = $1 WHERE id = $2`, taskID, agentID)
+// ClaimAgent atomically selects the oldest idle agent with the given role and marks it
+// working, using FOR UPDATE SKIP LOCKED and a NOT EXISTS guard that skips agents who
+// already have in-flight tasks (prevents double-assignment on reconnect).
+func (r *Repository) ClaimAgent(ctx context.Context, projectID uuid.UUID, role string) (uuid.UUID, error) {
+	var agentID uuid.UUID
+	err := r.pool.QueryRow(ctx, `
+		UPDATE agents
+		SET    status = 'working', current_task_id = NULL
+		WHERE  id = (
+		    SELECT a.id FROM agents a
+		    WHERE  a.project_id = $1
+		    AND    a.role       = $2
+		    AND    a.status     = 'idle'
+		    AND NOT EXISTS (
+		        SELECT 1 FROM tasks t
+		        WHERE  t.assigned_agent_id = a.id
+		        AND    t.status NOT IN ('merged', 'backlog')
+		    )
+		    ORDER  BY a.created_at ASC
+		    LIMIT  1
+		    FOR UPDATE SKIP LOCKED
+		)
+		RETURNING id`, projectID, role).Scan(&agentID)
 	if err != nil {
-		return fmt.Errorf("setting current task: %w", err)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return uuid.Nil, distributor.ErrNoAgentAvailable
+		}
+		return uuid.Nil, fmt.Errorf("claim agent: %w", err)
 	}
-	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("agent %s not found", agentID)
+	return agentID, nil
+}
+
+// SetIdleStatus marks an agent idle with no current task.
+func (r *Repository) SetIdleStatus(ctx context.Context, agentID uuid.UUID) error {
+	_, err := r.pool.Exec(ctx,
+		`UPDATE agents SET status = 'idle', current_task_id = NULL WHERE id = $1`,
+		agentID)
+	if err != nil {
+		return fmt.Errorf("set idle status: %w", err)
 	}
 	return nil
+}
+
+// SetWorkingStatus marks an agent as working on a specific task, recording current_task_id.
+func (r *Repository) SetWorkingStatus(ctx context.Context, agentID uuid.UUID, taskID uuid.UUID) error {
+	_, err := r.pool.Exec(ctx,
+		`UPDATE agents SET status = 'working', current_task_id = $2 WHERE id = $1`,
+		agentID, taskID)
+	if err != nil {
+		return fmt.Errorf("set working status: %w", err)
+	}
+	return nil
+}
+
+// ListOfflineWithInflightTasks returns IDs of offline agents that still have in_progress,
+// in_qa, or in_review tasks assigned to them. Used on startup to reschedule reaper timers.
+func (r *Repository) ListOfflineWithInflightTasks(ctx context.Context) ([]uuid.UUID, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT DISTINCT a.id FROM agents a
+		JOIN tasks t ON t.assigned_agent_id = a.id
+		WHERE a.status = 'offline'
+		  AND t.status IN ('in_progress', 'in_qa', 'in_review')`)
+	if err != nil {
+		return nil, fmt.Errorf("listing offline agents with inflight tasks: %w", err)
+	}
+	defer rows.Close()
+
+	var ids []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scanning agent id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 func (r *Repository) scanOne(ctx context.Context, query string, args ...interface{}) (domainagent.Agent, error) {

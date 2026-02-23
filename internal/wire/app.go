@@ -12,6 +12,7 @@ import (
 	pgdb "github.com/alanyang/agent-mesh/internal/adapter/postgres"
 	pgagent "github.com/alanyang/agent-mesh/internal/adapter/postgres/agent"
 	pgeventbus "github.com/alanyang/agent-mesh/internal/adapter/postgres/eventbus"
+	pglocker "github.com/alanyang/agent-mesh/internal/adapter/postgres/locker"
 	pgproject "github.com/alanyang/agent-mesh/internal/adapter/postgres/project"
 	pgprompt "github.com/alanyang/agent-mesh/internal/adapter/postgres/prompt"
 	pgtask "github.com/alanyang/agent-mesh/internal/adapter/postgres/task"
@@ -35,12 +36,12 @@ type App struct {
 	Pool      *pgxpool.Pool
 	Server    *http.Server
 	AgentSvc  *agentsvc.Service
+	TaskSvc   *tasksvc.Service
 	MCPServer *mcptransport.Server
 }
 
-// Build is the composition root: the ONLY place concrete types are wired to their
-// interface dependencies. All service dependencies flow in as ports.
-// [DIP] High-level modules (services) receive abstractions; Build provides concretions.
+// Build is the composition root: the only place concrete types are wired to their
+// interface dependencies.
 func Build(ctx context.Context) (*App, error) {
 	// ── Database ─────────────────────────────────────────────────────────────
 	dbURL := os.Getenv("DATABASE_URL")
@@ -53,32 +54,27 @@ func Build(ctx context.Context) (*App, error) {
 	}
 
 	// ── Adapters ─────────────────────────────────────────────────────────────
-	// taskRepo implements both port/task.Repository and port/agent.AgentAvailabilityReader.
 	taskRepo := pgtask.New(pool)
 	threadRepo := pgthread.New(pool)
 	agentRepo := pgagent.New(pool)
 	promptRepo := pgprompt.New(pool)
 	eventBus := pgeventbus.New(pool)
 	projectRepo := pgproject.New(pool)
+	locker := pglocker.New(pool)
 
 	// ── Services ─────────────────────────────────────────────────────────────
 
-	// 1. Distributor depends only on AgentAvailabilityReader (ISP).
-	distSvc := distsvc.NewService(taskRepo)
+	// Distributor uses agentRepo.ClaimAgent (atomic SELECT + UPDATE).
+	distSvc := distsvc.NewService(agentRepo)
 
-	// 2. Thread + agent + prompt services have no inter-service dependencies.
-	threadSvc := threadsvc.NewService(threadRepo, eventBus)
-	agentSvc := agentsvc.NewService(agentRepo, taskRepo, eventBus)
+	threadSvcInstance := threadsvc.NewService(threadRepo, eventBus)
+	agentSvcInstance := agentsvc.NewService(agentRepo, taskRepo, eventBus)
 	promptSvcInstance := promptsvc.NewService(promptRepo)
 	projectSvcInstance := projectsvc.NewService(projectRepo)
 
-	// 3. Create the SessionRegistry before taskSvc — taskSvc needs it as notifier ports.
-	//    The registry's MCPServer reference is set by mcptransport.New() below.
 	reg := mcptransport.NewSessionRegistry()
 
-	// 4. TaskSvc receives pipeline.Config and notifier ports.
-	//    [DIP] taskSvc never imports the MCP transport package — it depends on ports.
-	taskSvc := tasksvc.NewService(
+	taskSvcInstance := tasksvc.NewService(
 		taskRepo,
 		eventBus,
 		distSvc,
@@ -86,17 +82,17 @@ func Build(ctx context.Context) (*App, error) {
 		reg, // implements port/notifier.AgentNotifier
 		reg, // implements port/notifier.RoleNotifier
 		pipeline.DefaultConfig,
+		locker,
 	)
 
-	// 5. MCP transport server — injects the mcp-go server into reg and registers tools/prompts.
-	mcpServer := mcptransport.New(reg, taskSvc, agentSvc, threadSvc, promptSvcInstance)
+	mcpServer := mcptransport.New(reg, taskSvcInstance, agentSvcInstance, threadSvcInstance, promptSvcInstance)
 
 	// ── Transport ─────────────────────────────────────────────────────────────
 	router := transport.NewRouter(
 		ctx,
-		taskSvc,
-		threadSvc,
-		agentSvc,
+		taskSvcInstance,
+		threadSvcInstance,
+		agentSvcInstance,
 		projectSvcInstance,
 		promptSvcInstance,
 		mcpServer,
@@ -114,10 +110,16 @@ func Build(ctx context.Context) (*App, error) {
 
 	slog.Info("application wired", "port", port)
 
-	return &App{
+	app := &App{
 		Pool:      pool,
 		Server:    server,
-		AgentSvc:  agentSvc,
+		AgentSvc:  agentSvcInstance,
+		TaskSvc:   taskSvcInstance,
 		MCPServer: mcpServer,
-	}, nil
+	}
+
+	// ── Event-Driven Grace-Period Reaper ──────────────────────────────────────
+	startReaper(ctx, app, eventBus)
+
+	return app, nil
 }

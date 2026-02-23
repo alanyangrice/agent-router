@@ -3,6 +3,7 @@ package task
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 
 	"github.com/google/uuid"
@@ -13,17 +14,14 @@ import (
 	domainthread "github.com/alanyang/agent-mesh/internal/domain/thread"
 	portdist "github.com/alanyang/agent-mesh/internal/port/distributor"
 	portbus "github.com/alanyang/agent-mesh/internal/port/eventbus"
+	portlocker "github.com/alanyang/agent-mesh/internal/port/locker"
 	portnotifier "github.com/alanyang/agent-mesh/internal/port/notifier"
 	porttask "github.com/alanyang/agent-mesh/internal/port/task"
 	portthread "github.com/alanyang/agent-mesh/internal/port/thread"
 )
 
 // Service manages task lifecycle and drives the pipeline.
-// [SRP] Task state management and pipeline coordination only.
-// [OCP] Pipeline routing is driven by injected pipeline.Config — adding a stage
-//
-//	extends the config without modifying this service.
-//
+// [OCP] Pipeline routing is driven by injected pipeline.Config.
 // [DIP] Depends on ports, never on adapters or transport.
 type Service struct {
 	repo           porttask.Repository
@@ -33,6 +31,7 @@ type Service struct {
 	agentNotifier  portnotifier.AgentNotifier
 	roleNotifier   portnotifier.RoleNotifier
 	pipelineConfig pipeline.Config
+	locker         portlocker.AdvisoryLocker
 }
 
 func NewService(
@@ -43,6 +42,7 @@ func NewService(
 	agentNotifier portnotifier.AgentNotifier,
 	roleNotifier portnotifier.RoleNotifier,
 	pipelineConfig pipeline.Config,
+	locker portlocker.AdvisoryLocker,
 ) *Service {
 	return &Service{
 		repo:           repo,
@@ -52,6 +52,7 @@ func NewService(
 		agentNotifier:  agentNotifier,
 		roleNotifier:   roleNotifier,
 		pipelineConfig: pipelineConfig,
+		locker:         locker,
 	}
 }
 
@@ -93,8 +94,7 @@ func (s *Service) List(ctx context.Context, filters domaintask.ListFilters) ([]d
 }
 
 // UpdateStatus performs a CAS status transition and drives the pipeline.
-// Pipeline routing is entirely driven by pipeline.Config — no switch statement.
-// [OCP] To add a pipeline stage: extend pipeline.DefaultConfig, no change here.
+// Pipeline routing is entirely driven by pipeline.Config — no switch statement (OCP).
 func (s *Service) UpdateStatus(ctx context.Context, id uuid.UUID, from, to domaintask.Status) error {
 	if !from.CanTransitionTo(to) {
 		return fmt.Errorf("invalid transition from %s to %s", from, to)
@@ -103,63 +103,106 @@ func (s *Service) UpdateStatus(ctx context.Context, id uuid.UUID, from, to domai
 	if err := s.repo.UpdateStatus(ctx, id, from, to); err != nil {
 		return fmt.Errorf("update task status: %w", err)
 	}
-
-	if err := s.bus.Publish(ctx, event.New(event.TypeTaskUpdated, id)); err != nil {
-		slog.ErrorContext(ctx, "failed to publish TaskUpdated event", "task_id", id, "error", err)
-	}
+	s.bus.Publish(ctx, event.New(event.TypeTaskUpdated, id)) //nolint:errcheck
 
 	t, err := s.repo.GetByID(ctx, id)
 	if err != nil {
-		slog.ErrorContext(ctx, "failed to fetch task for pipeline action", "task_id", id, "error", err)
-		return nil
+		return fmt.Errorf("fetch task after status update: %w", err)
+	}
+
+	// ── Bounce-back: prefer original coder, fallback to any available coder ──────────
+	// Top-level, NOT inside AssignRole, because pipelineConfig[in_progress].AssignRole="".
+	if to == domaintask.StatusInProgress &&
+		(from == domaintask.StatusInQA || from == domaintask.StatusInReview) {
+
+		assignedAgentID, notifyEvent := uuid.Nil, "task_returned"
+
+		// Preferred path: atomically assign back to original coder if they are still idle.
+		// AssignIfIdle uses a CTE that locks the agent row — no TOCTOU race.
+		if t.CoderID != nil {
+			ok, err := s.repo.AssignIfIdle(ctx, id, *t.CoderID)
+			if err != nil {
+				return fmt.Errorf("bounce-back preferred assign: %w", err)
+			}
+			if ok {
+				assignedAgentID = *t.CoderID
+			}
+		}
+
+		// Fallback: original coder busy/offline, or CoderID unset.
+		// Role is read from config — not hardcoded ("coder").
+		if assignedAgentID == uuid.Nil {
+			fallbackRole := s.pipelineConfig[domaintask.StatusInProgress].FreedRole
+			fallbackAgentID, err := s.dist.Distribute(ctx, t.ProjectID, fallbackRole)
+			if err != nil {
+				slog.Info("bounce-back: no coder available", "task_id", id)
+			} else {
+				assignedAgentID = fallbackAgentID
+				notifyEvent = "task_assigned"
+				if err := s.repo.Assign(ctx, id, assignedAgentID); err != nil {
+					return fmt.Errorf("bounce-back fallback assign: %w", err)
+				}
+			}
+		}
+
+		if assignedAgentID != uuid.Nil {
+			s.agentNotifier.NotifyAgent(ctx, assignedAgentID, map[string]string{ //nolint:errcheck
+				"event": notifyEvent, "task_id": id.String(),
+			})
+			s.bus.Publish(ctx, event.New(event.TypeTaskAssigned, id)) //nolint:errcheck
+		}
+
+		// Sweep for the freed QA/reviewer slot — BEFORE return so it is never lost.
+		if fromAction, ok := s.pipelineConfig[from]; ok && fromAction.FreedRole != "" {
+			role, projectID := fromAction.FreedRole, t.ProjectID
+			go func() {
+				if err := s.SweepUnassigned(context.Background(), projectID, role); err != nil {
+					slog.Error("sweep failed after bounce-back", "role", role, "error", err)
+				}
+			}()
+		}
+
+		return nil // skip normal AssignRole/BroadcastEvent/TypeTaskCompleted
 	}
 
 	action, ok := s.pipelineConfig[to]
 	if !ok {
-		// No pipeline action configured for this status — nothing more to do.
 		return nil
 	}
 
-	// Assign a new agent if the stage requires a specific role.
+	// ── AssignRole: assign task to a new agent ────────────────────────────────────────
 	if action.AssignRole != "" {
 		agentID, err := s.dist.Distribute(ctx, t.ProjectID, action.AssignRole)
 		if err != nil {
-			slog.InfoContext(ctx, "pipeline: no agent available for role", "task_id", id, "role", action.AssignRole)
-			// Task stays in the new status but unassigned. MCP claim_task will pick it up.
-			return nil
-		}
-
-		// Ownership lock: when bouncing back to in_progress, preserve the existing coder.
-		// Only assign a new agent if either there is no current assignment OR the stage
-		// explicitly needs a different role (e.g. in_qa → qa, in_review → reviewer).
-		if to == domaintask.StatusInProgress && t.AssignedAgentID != nil {
-			// Keep the existing coder assigned — notify them.
-			if err := s.agentNotifier.NotifyAgent(ctx, *t.AssignedAgentID, map[string]string{
-				"event":   "task_assigned",
-				"task_id": id.String(),
-			}); err != nil {
-				slog.ErrorContext(ctx, "pipeline: failed to notify coder of bounce-back", "agent_id", *t.AssignedAgentID, "error", err)
-			}
+			slog.Info("pipeline: no agent available", "task_id", id, "role", action.AssignRole)
+			// Task stays unassigned — SweepUnassigned will pick it up when an agent frees.
+			// Do NOT return early — still run BroadcastEvent and TypeTaskCompleted below.
 		} else {
 			if err := s.repo.Assign(ctx, id, agentID); err != nil {
-				slog.ErrorContext(ctx, "pipeline: failed to assign task", "task_id", id, "agent_id", agentID, "error", err)
-				return nil
+				return fmt.Errorf("assign task to agent: %w", err)
 			}
-			if err := s.agentNotifier.NotifyAgent(ctx, agentID, map[string]string{
-				"event":   "task_assigned",
-				"task_id": id.String(),
-			}); err != nil {
-				slog.ErrorContext(ctx, "pipeline: failed to notify assigned agent", "agent_id", agentID, "error", err)
-			}
-			if err := s.bus.Publish(ctx, event.New(event.TypeTaskAssigned, id)); err != nil {
-				slog.ErrorContext(ctx, "failed to publish TaskAssigned event", "task_id", id, "error", err)
-			}
+			s.agentNotifier.NotifyAgent(ctx, agentID, map[string]string{ //nolint:errcheck
+				"event": "task_assigned", "task_id": id.String(),
+			})
+			s.bus.Publish(ctx, event.New(event.TypeTaskAssigned, id)) //nolint:errcheck
 		}
 	}
 
-	// Broadcast a notification to all agents of a specific role (e.g. main_updated to coders).
-	if action.BroadcastEvent != "" {
-		if err := s.roleNotifier.NotifyProjectRole(ctx, t.ProjectID, "coder", map[string]string{
+	// ── FreedRole sweep: fire when leaving `from` status ─────────────────────────────
+	// pipelineConfig[from].FreedRole names the role that was doing `from` work.
+	// Using context.Background() so the goroutine outlives the request context.
+	if fromAction, ok := s.pipelineConfig[from]; ok && fromAction.FreedRole != "" {
+		role, projectID := fromAction.FreedRole, t.ProjectID
+		go func() {
+			if err := s.SweepUnassigned(context.Background(), projectID, role); err != nil {
+				slog.Error("sweep failed after status transition", "role", role, "error", err)
+			}
+		}()
+	}
+
+	// ── BroadcastEvent: notify a role (independent of AssignRole) ────────────────────
+	if action.BroadcastEvent != "" && action.BroadcastRole != "" {
+		if err := s.roleNotifier.NotifyProjectRole(ctx, t.ProjectID, action.BroadcastRole, map[string]string{
 			"event":          action.BroadcastEvent,
 			"merged_task_id": id.String(),
 		}); err != nil {
@@ -167,22 +210,57 @@ func (s *Service) UpdateStatus(ctx context.Context, id uuid.UUID, from, to domai
 		}
 	}
 
+	// ── TypeTaskCompleted: always publish on merge (independent of AssignRole) ───────
 	if to == domaintask.StatusMerged {
-		if err := s.bus.Publish(ctx, event.New(event.TypeTaskCompleted, id)); err != nil {
-			slog.ErrorContext(ctx, "failed to publish TaskCompleted event", "task_id", id, "error", err)
-		}
+		s.bus.Publish(ctx, event.New(event.TypeTaskCompleted, id)) //nolint:errcheck
 	}
 
 	return nil
+}
+
+// SweepUnassigned finds unassigned tasks for the given role and assigns them to
+// available agents. Protected by a Postgres advisory lock so concurrent sweeps for
+// the same (projectID, role) are serialised — the advisory lock prevents the race
+// where two sweeps both call Distribute and pick the same agent.
+func (s *Service) SweepUnassigned(ctx context.Context, projectID uuid.UUID, role string) error {
+	key := advisoryKey(projectID, role)
+	return s.locker.WithLock(ctx, key, func(ctx context.Context) error {
+		for status, action := range s.pipelineConfig {
+			if action.AssignRole != role {
+				continue
+			}
+			tasks, err := s.repo.List(ctx, domaintask.ListFilters{
+				ProjectID:   &projectID,
+				Status:      &status,
+				Unassigned:  true,
+				OldestFirst: true,
+			})
+			if err != nil {
+				return fmt.Errorf("list unassigned tasks: %w", err)
+			}
+			for _, t := range tasks {
+				agentID, err := s.dist.Distribute(ctx, projectID, role)
+				if err != nil {
+					return nil // no agents left — stop, not an error
+				}
+				if err := s.repo.Assign(ctx, t.ID, agentID); err != nil {
+					return fmt.Errorf("assign task %s: %w", t.ID, err)
+				}
+				s.agentNotifier.NotifyAgent(ctx, agentID, map[string]string{ //nolint:errcheck
+					"event": "task_assigned", "task_id": t.ID.String(),
+				})
+				s.bus.Publish(ctx, event.New(event.TypeTaskAssigned, t.ID)) //nolint:errcheck
+			}
+		}
+		return nil
+	})
 }
 
 func (s *Service) SetPRUrl(ctx context.Context, id uuid.UUID, prURL string) error {
 	if err := s.repo.SetPRUrl(ctx, id, prURL); err != nil {
 		return fmt.Errorf("set pr_url: %w", err)
 	}
-	if err := s.bus.Publish(ctx, event.New(event.TypeTaskUpdated, id)); err != nil {
-		slog.ErrorContext(ctx, "failed to publish TaskUpdated after pr_url set", "task_id", id, "error", err)
-	}
+	s.bus.Publish(ctx, event.New(event.TypeTaskUpdated, id)) //nolint:errcheck
 	return nil
 }
 
@@ -207,4 +285,12 @@ func (s *Service) GetDependencies(ctx context.Context, taskID uuid.UUID) ([]doma
 		return nil, fmt.Errorf("get dependencies: %w", err)
 	}
 	return tasks, nil
+}
+
+// advisoryKey hashes (projectID, role) to a stable int64 for pg_advisory_lock.
+func advisoryKey(projectID uuid.UUID, role string) int64 {
+	h := fnv.New64a()
+	h.Write(projectID[:])
+	h.Write([]byte(role))
+	return int64(h.Sum64())
 }
