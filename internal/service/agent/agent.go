@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"time"
 
 	"github.com/google/uuid"
 
@@ -13,19 +12,19 @@ import (
 	domaintask "github.com/alanyang/agent-mesh/internal/domain/task"
 	portagent "github.com/alanyang/agent-mesh/internal/port/agent"
 	portbus "github.com/alanyang/agent-mesh/internal/port/eventbus"
-	portdist "github.com/alanyang/agent-mesh/internal/port/distributor"
 	porttask "github.com/alanyang/agent-mesh/internal/port/task"
 )
 
+// Service manages agent lifecycle: registration, status, and orphan recovery.
+// [SRP] Agent lifecycle only. Reaper scheduling is the MCP server's responsibility.
 type Service struct {
 	repo     portagent.Repository
 	taskRepo porttask.Repository
 	bus      portbus.EventBus
-	dist     portdist.Distributor
 }
 
-func NewService(repo portagent.Repository, taskRepo porttask.Repository, bus portbus.EventBus, dist portdist.Distributor) *Service {
-	return &Service{repo: repo, taskRepo: taskRepo, bus: bus, dist: dist}
+func NewService(repo portagent.Repository, taskRepo porttask.Repository, bus portbus.EventBus) *Service {
+	return &Service{repo: repo, taskRepo: taskRepo, bus: bus}
 }
 
 func (s *Service) Register(ctx context.Context, projectID uuid.UUID, role, name, model string, skills []string) (domainagent.Agent, error) {
@@ -59,108 +58,60 @@ func (s *Service) List(ctx context.Context, filters domainagent.ListFilters) ([]
 	return agents, nil
 }
 
-func (s *Service) Heartbeat(ctx context.Context, id uuid.UUID) error {
-	a, err := s.repo.GetByID(ctx, id)
+// Reactivate marks an existing agent as idle and publishes TypeAgentOnline.
+// Called when an agent reconnects with a previously-issued agent_id.
+// Returns an error if the agent does not exist — the caller should fall back to Register.
+func (s *Service) Reactivate(ctx context.Context, agentID uuid.UUID) (domainagent.Agent, error) {
+	a, err := s.repo.GetByID(ctx, agentID)
 	if err != nil {
-		return fmt.Errorf("get agent for heartbeat: %w", err)
+		return domainagent.Agent{}, fmt.Errorf("agent not found: %w", err)
 	}
-
-	if err := s.repo.UpdateHeartbeat(ctx, id); err != nil {
-		return fmt.Errorf("update heartbeat: %w", err)
+	if err := s.repo.UpdateStatus(ctx, agentID, domainagent.StatusIdle); err != nil {
+		return domainagent.Agent{}, fmt.Errorf("reactivate agent: %w", err)
 	}
-
-	if err := s.bus.Publish(ctx, event.New(event.TypeAgentHeartbeat, id)); err != nil {
-		slog.ErrorContext(ctx, "failed to publish AgentHeartbeat event", "agent_id", id, "error", err)
+	a.Status = domainagent.StatusIdle
+	if err := s.bus.Publish(ctx, event.New(event.TypeAgentOnline, agentID)); err != nil {
+		slog.ErrorContext(ctx, "failed to publish AgentOnline on reactivate", "agent_id", agentID, "error", err)
 	}
-
-	// If idle, ask the distributor to assign any pending ready tasks.
-	// The assigned agent will poll for its ready tasks and own the status transition.
-	if a.Status == domainagent.StatusIdle {
-		go func() {
-			bgCtx := context.WithoutCancel(ctx)
-			assignments, err := s.dist.Rebalance(bgCtx, a.ProjectID)
-			if err != nil {
-				slog.ErrorContext(bgCtx, "heartbeat: rebalance failed", "agent_id", id, "error", err)
-				return
-			}
-			for _, assignment := range assignments {
-				if err := s.bus.Publish(bgCtx, event.New(event.TypeTaskAssigned, assignment.TaskID)); err != nil {
-					slog.ErrorContext(bgCtx, "heartbeat: failed to publish TaskAssigned", "task_id", assignment.TaskID, "error", err)
-				}
-				slog.InfoContext(bgCtx, "heartbeat: rebalanced task to agent", "task_id", assignment.TaskID, "agent_id", assignment.AgentID)
-			}
-		}()
-	}
-
-	return nil
+	return a, nil
 }
 
-func (s *Service) MarkOffline(ctx context.Context, id uuid.UUID) error {
-	if err := s.repo.UpdateStatus(ctx, id, domainagent.StatusOffline); err != nil {
-		return fmt.Errorf("mark agent offline: %w", err)
-	}
-
-	if err := s.bus.Publish(ctx, event.New(event.TypeAgentOffline, id)); err != nil {
-		slog.ErrorContext(ctx, "failed to publish AgentOffline event", "agent_id", id, "error", err)
-	}
-
-	return nil
-}
-
-// StartReaper runs a background goroutine that periodically detects stale
-// agents and marks them offline, resetting their assigned tasks to "ready".
-func (s *Service) StartReaper(ctx context.Context, thresholdSeconds int) {
-	ticker := time.NewTicker(time.Duration(thresholdSeconds) * time.Second)
-	go func() {
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				slog.InfoContext(ctx, "agent reaper stopped")
-				return
-			case <-ticker.C:
-				s.reap(ctx, thresholdSeconds)
-			}
-		}
-	}()
-}
-
-func (s *Service) reap(ctx context.Context, thresholdSeconds int) {
-	stale, err := s.repo.GetStale(ctx, thresholdSeconds)
+// ReapOrphaned is called by the MCP server when an agent's SSE session closes.
+// It marks the agent offline and recovers any orphaned tasks.
+// [SRP] This is the agent service's only lifecycle responsibility outside registration.
+func (s *Service) ReapOrphaned(ctx context.Context, agentID uuid.UUID) {
+	a, err := s.repo.GetByID(ctx, agentID)
 	if err != nil {
-		slog.ErrorContext(ctx, "reaper: failed to get stale agents", "error", err)
+		slog.ErrorContext(ctx, "reap: agent not found", "agent_id", agentID, "error", err)
 		return
 	}
 
-	for _, a := range stale {
-		if err := s.repo.UpdateStatus(ctx, a.ID, domainagent.StatusOffline); err != nil {
-			slog.ErrorContext(ctx, "reaper: failed to mark agent offline", "agent_id", a.ID, "error", err)
-			continue
-		}
-
-		// Reset any in_progress task the agent was actively working on.
-		if a.CurrentTaskID != nil {
-			if err := s.taskRepo.UpdateStatus(ctx, *a.CurrentTaskID, domaintask.StatusInProgress, domaintask.StatusReady); err != nil {
-				slog.ErrorContext(ctx, "reaper: failed to reset task to ready", "task_id", *a.CurrentTaskID, "error", err)
-			}
-			if err := s.taskRepo.Unassign(ctx, *a.CurrentTaskID); err != nil {
-				slog.ErrorContext(ctx, "reaper: failed to unassign task", "task_id", *a.CurrentTaskID, "error", err)
-			}
-			if err := s.repo.SetCurrentTask(ctx, a.ID, nil); err != nil {
-				slog.ErrorContext(ctx, "reaper: failed to clear agent current task", "agent_id", a.ID, "error", err)
-			}
-		}
-
-		// Release any ready tasks assigned to this agent that it never started.
-		// These won't have a CurrentTaskID since the agent owns the ready→in_progress transition.
-		if err := s.taskRepo.UnassignByAgent(ctx, a.ID); err != nil {
-			slog.ErrorContext(ctx, "reaper: failed to release ready tasks for offline agent", "agent_id", a.ID, "error", err)
-		}
-
-		if err := s.bus.Publish(ctx, event.New(event.TypeAgentOffline, a.ID)); err != nil {
-			slog.ErrorContext(ctx, "reaper: failed to publish AgentOffline event", "agent_id", a.ID, "error", err)
-		}
-
-		slog.InfoContext(ctx, "reaper: marked agent offline", "agent_id", a.ID)
+	if err := s.repo.UpdateStatus(ctx, agentID, domainagent.StatusOffline); err != nil {
+		slog.ErrorContext(ctx, "reap: failed to mark agent offline", "agent_id", agentID, "error", err)
+		return
 	}
+
+	// Reset any in-progress task back to ready so another agent can pick it up.
+	if a.CurrentTaskID != nil {
+		if err := s.taskRepo.UpdateStatus(ctx, *a.CurrentTaskID, domaintask.StatusInProgress, domaintask.StatusReady); err != nil {
+			slog.ErrorContext(ctx, "reap: failed to reset in-progress task", "task_id", *a.CurrentTaskID, "error", err)
+		}
+		if err := s.taskRepo.Unassign(ctx, *a.CurrentTaskID); err != nil {
+			slog.ErrorContext(ctx, "reap: failed to unassign task", "task_id", *a.CurrentTaskID, "error", err)
+		}
+		if err := s.repo.SetCurrentTask(ctx, agentID, nil); err != nil {
+			slog.ErrorContext(ctx, "reap: failed to clear current task", "agent_id", agentID, "error", err)
+		}
+	}
+
+	// Also release any ready tasks that were assigned but never started.
+	if err := s.taskRepo.UnassignByAgent(ctx, agentID); err != nil {
+		slog.ErrorContext(ctx, "reap: failed to unassign ready tasks", "agent_id", agentID, "error", err)
+	}
+
+	if err := s.bus.Publish(ctx, event.New(event.TypeAgentOffline, agentID)); err != nil {
+		slog.ErrorContext(ctx, "reap: failed to publish AgentOffline event", "agent_id", agentID, "error", err)
+	}
+
+	slog.InfoContext(ctx, "reap: agent session closed, tasks recovered", "agent_id", agentID)
 }

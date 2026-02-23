@@ -13,72 +13,95 @@ import (
 	pgagent "github.com/alanyang/agent-mesh/internal/adapter/postgres/agent"
 	pgeventbus "github.com/alanyang/agent-mesh/internal/adapter/postgres/eventbus"
 	pgproject "github.com/alanyang/agent-mesh/internal/adapter/postgres/project"
+	pgprompt "github.com/alanyang/agent-mesh/internal/adapter/postgres/prompt"
 	pgtask "github.com/alanyang/agent-mesh/internal/adapter/postgres/task"
 	pgthread "github.com/alanyang/agent-mesh/internal/adapter/postgres/thread"
 
-	ghclient "github.com/alanyang/agent-mesh/internal/adapter/github"
+	"github.com/alanyang/agent-mesh/internal/domain/pipeline"
 
 	agentsvc "github.com/alanyang/agent-mesh/internal/service/agent"
 	distsvc "github.com/alanyang/agent-mesh/internal/service/distributor"
-	gitsvc "github.com/alanyang/agent-mesh/internal/service/git"
 	projectsvc "github.com/alanyang/agent-mesh/internal/service/project"
+	promptsvc "github.com/alanyang/agent-mesh/internal/service/prompt"
 	tasksvc "github.com/alanyang/agent-mesh/internal/service/task"
 	threadsvc "github.com/alanyang/agent-mesh/internal/service/thread"
 
 	"github.com/alanyang/agent-mesh/internal/transport"
+	mcptransport "github.com/alanyang/agent-mesh/internal/transport/mcp"
 )
 
 // App holds the top-level resources needed to run and gracefully stop the server.
 type App struct {
-	Pool     *pgxpool.Pool
-	Server   *http.Server
-	AgentSvc *agentsvc.Service
+	Pool      *pgxpool.Pool
+	Server    *http.Server
+	AgentSvc  *agentsvc.Service
+	MCPServer *mcptransport.Server
 }
 
-// Build is the composition root: it reads configuration, connects to the
-// database, constructs every adapter and service, and returns a ready-to-start App.
+// Build is the composition root: the ONLY place concrete types are wired to their
+// interface dependencies. All service dependencies flow in as ports.
+// [DIP] High-level modules (services) receive abstractions; Build provides concretions.
 func Build(ctx context.Context) (*App, error) {
-	// ── Database ────────────────────────────────────────────────────────
+	// ── Database ─────────────────────────────────────────────────────────────
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		return nil, fmt.Errorf("no dbURL set")
+		return nil, fmt.Errorf("DATABASE_URL not set")
 	}
 	pool, err := pgdb.Connect(ctx, dbURL)
 	if err != nil {
 		return nil, fmt.Errorf("connecting to database: %w", err)
 	}
 
-	// ── Adapters ────────────────────────────────────────────────────────
+	// ── Adapters ─────────────────────────────────────────────────────────────
+	// taskRepo implements both port/task.Repository and port/agent.AgentAvailabilityReader.
 	taskRepo := pgtask.New(pool)
 	threadRepo := pgthread.New(pool)
 	agentRepo := pgagent.New(pool)
+	promptRepo := pgprompt.New(pool)
 	eventBus := pgeventbus.New(pool)
-
-	// GitHub adapter – only initialised when all required env vars are set.
-	ghToken := os.Getenv("GITHUB_TOKEN")
-	ghOwner := os.Getenv("GITHUB_OWNER")
-	ghRepoName := os.Getenv("GITHUB_REPO")
-	var gitProvider *ghclient.Client
-	if ghToken != "" && ghOwner != "" && ghRepoName != "" {
-		gitProvider = ghclient.NewClient(ghToken, ghOwner, ghRepoName)
-	}
-
-	// ── Services ────────────────────────────────────────────────────────
-	distSvc := distsvc.NewService(taskRepo, agentRepo)
-	taskSvc := tasksvc.NewService(taskRepo, eventBus, distSvc, threadRepo)
-	threadSvc := threadsvc.NewService(threadRepo, eventBus)
-	agentSvc := agentsvc.NewService(agentRepo, taskRepo, eventBus, distSvc)
-
-	var gitSvcInstance *gitsvc.Service
-	if gitProvider != nil {
-		gitSvcInstance = gitsvc.NewService(gitProvider)
-	}
-
 	projectRepo := pgproject.New(pool)
+
+	// ── Services ─────────────────────────────────────────────────────────────
+
+	// 1. Distributor depends only on AgentAvailabilityReader (ISP).
+	distSvc := distsvc.NewService(taskRepo)
+
+	// 2. Thread + agent + prompt services have no inter-service dependencies.
+	threadSvc := threadsvc.NewService(threadRepo, eventBus)
+	agentSvc := agentsvc.NewService(agentRepo, taskRepo, eventBus)
+	promptSvcInstance := promptsvc.NewService(promptRepo)
 	projectSvcInstance := projectsvc.NewService(projectRepo)
 
-	// ── Transport ───────────────────────────────────────────────────────
-	router := transport.NewRouter(ctx, taskSvc, threadSvc, agentSvc, gitSvcInstance, projectSvcInstance, eventBus)
+	// 3. Create the SessionRegistry before taskSvc — taskSvc needs it as notifier ports.
+	//    The registry's MCPServer reference is set by mcptransport.New() below.
+	reg := mcptransport.NewSessionRegistry()
+
+	// 4. TaskSvc receives pipeline.Config and notifier ports.
+	//    [DIP] taskSvc never imports the MCP transport package — it depends on ports.
+	taskSvc := tasksvc.NewService(
+		taskRepo,
+		eventBus,
+		distSvc,
+		threadRepo,
+		reg, // implements port/notifier.AgentNotifier
+		reg, // implements port/notifier.RoleNotifier
+		pipeline.DefaultConfig,
+	)
+
+	// 5. MCP transport server — injects the mcp-go server into reg and registers tools/prompts.
+	mcpServer := mcptransport.New(reg, taskSvc, agentSvc, threadSvc, promptSvcInstance)
+
+	// ── Transport ─────────────────────────────────────────────────────────────
+	router := transport.NewRouter(
+		ctx,
+		taskSvc,
+		threadSvc,
+		agentSvc,
+		projectSvcInstance,
+		promptSvcInstance,
+		mcpServer,
+		eventBus,
+	)
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -92,8 +115,9 @@ func Build(ctx context.Context) (*App, error) {
 	slog.Info("application wired", "port", port)
 
 	return &App{
-		Pool:     pool,
-		Server:   server,
-		AgentSvc: agentSvc,
+		Pool:      pool,
+		Server:    server,
+		AgentSvc:  agentSvc,
+		MCPServer: mcpServer,
 	}, nil
 }

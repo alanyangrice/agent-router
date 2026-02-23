@@ -103,58 +103,6 @@ func (r *Repository) List(ctx context.Context, filters domainagent.ListFilters) 
 	return scanAgents(rows)
 }
 
-func (r *Repository) Update(ctx context.Context, a domainagent.Agent) error {
-	configJSON, err := json.Marshal(a.Config)
-	if err != nil {
-		return fmt.Errorf("marshaling config: %w", err)
-	}
-	statsJSON, err := json.Marshal(a.Stats)
-	if err != nil {
-		return fmt.Errorf("marshaling stats: %w", err)
-	}
-
-	query := `
-		UPDATE agents SET
-			role = $2, name = $3, skills = $4, model = $5, status = $6,
-			current_task_id = $7, config_jsonb = $8, stats_jsonb = $9,
-			last_heartbeat_at = $10
-		WHERE id = $1`
-
-	tag, err := r.pool.Exec(ctx, query,
-		a.ID, a.Role, a.Name, a.Skills, a.Model, a.Status,
-		a.CurrentTaskID, configJSON, statsJSON, a.LastHeartbeatAt,
-	)
-	if err != nil {
-		return fmt.Errorf("updating agent: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("agent %s not found", a.ID)
-	}
-	return nil
-}
-
-func (r *Repository) Delete(ctx context.Context, id uuid.UUID) error {
-	tag, err := r.pool.Exec(ctx, `DELETE FROM agents WHERE id = $1`, id)
-	if err != nil {
-		return fmt.Errorf("deleting agent: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("agent %s not found", id)
-	}
-	return nil
-}
-
-func (r *Repository) UpdateHeartbeat(ctx context.Context, id uuid.UUID) error {
-	tag, err := r.pool.Exec(ctx, `UPDATE agents SET last_heartbeat_at = NOW() WHERE id = $1`, id)
-	if err != nil {
-		return fmt.Errorf("updating heartbeat: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("agent %s not found", id)
-	}
-	return nil
-}
-
 func (r *Repository) UpdateStatus(ctx context.Context, id uuid.UUID, status domainagent.Status) error {
 	tag, err := r.pool.Exec(ctx, `UPDATE agents SET status = $1 WHERE id = $2`, string(status), id)
 	if err != nil {
@@ -175,41 +123,6 @@ func (r *Repository) SetCurrentTask(ctx context.Context, agentID uuid.UUID, task
 		return fmt.Errorf("agent %s not found", agentID)
 	}
 	return nil
-}
-
-func (r *Repository) GetAvailable(ctx context.Context, projectID uuid.UUID) ([]domainagent.Agent, error) {
-	query := `
-		SELECT id, project_id, role, name, skills, model, status,
-			current_task_id, config_jsonb, stats_jsonb, last_heartbeat_at, created_at
-		FROM agents
-		WHERE project_id = $1 AND status = 'idle'
-		ORDER BY created_at`
-
-	rows, err := r.pool.Query(ctx, query, projectID)
-	if err != nil {
-		return nil, fmt.Errorf("getting available agents: %w", err)
-	}
-	defer rows.Close()
-
-	return scanAgents(rows)
-}
-
-func (r *Repository) GetStale(ctx context.Context, thresholdSeconds int) ([]domainagent.Agent, error) {
-	query := `
-		SELECT id, project_id, role, name, skills, model, status,
-			current_task_id, config_jsonb, stats_jsonb, last_heartbeat_at, created_at
-		FROM agents
-		WHERE last_heartbeat_at < NOW() - make_interval(secs => $1)
-		  AND status != 'offline'
-		ORDER BY last_heartbeat_at ASC`
-
-	rows, err := r.pool.Query(ctx, query, thresholdSeconds)
-	if err != nil {
-		return nil, fmt.Errorf("getting stale agents: %w", err)
-	}
-	defer rows.Close()
-
-	return scanAgents(rows)
 }
 
 func (r *Repository) scanOne(ctx context.Context, query string, args ...interface{}) (domainagent.Agent, error) {

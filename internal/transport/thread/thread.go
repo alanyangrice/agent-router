@@ -18,10 +18,9 @@ func Register(rg *gin.RouterGroup, svc *threadsvc.Service) {
 }
 
 type createThreadReq struct {
-	ProjectID uuid.UUID              `json:"project_id" binding:"required"`
-	TaskID    *uuid.UUID             `json:"task_id"`
-	Type      domainthread.ThreadType `json:"type" binding:"required"`
-	Name      string                 `json:"name" binding:"required"`
+	ProjectID uuid.UUID  `json:"project_id" binding:"required"`
+	TaskID    *uuid.UUID `json:"task_id"`
+	Name      string     `json:"name" binding:"required"`
 }
 
 func createThread(svc *threadsvc.Service) gin.HandlerFunc {
@@ -31,7 +30,7 @@ func createThread(svc *threadsvc.Service) gin.HandlerFunc {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
-		t, err := svc.CreateThread(c.Request.Context(), req.ProjectID, req.Type, req.Name, req.TaskID)
+		t, err := svc.CreateThread(c.Request.Context(), req.ProjectID, domainthread.TypeTask, req.Name, req.TaskID)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
@@ -59,10 +58,6 @@ func listThreads(svc *threadsvc.Service) gin.HandlerFunc {
 				return
 			}
 			filters.TaskID = &id
-		}
-		if v := c.Query("type"); v != "" {
-			tt := domainthread.ThreadType(v)
-			filters.Type = &tt
 		}
 
 		threads, err := svc.ListThreads(c.Request.Context(), filters)

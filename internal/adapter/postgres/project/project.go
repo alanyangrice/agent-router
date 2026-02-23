@@ -8,10 +8,11 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	projectsvc "github.com/alanyang/agent-mesh/internal/service/project"
+	domainproject "github.com/alanyang/agent-mesh/internal/domain/project"
+	portproject "github.com/alanyang/agent-mesh/internal/port/project"
 )
 
-var _ projectsvc.Repository = (*Repository)(nil)
+var _ portproject.Repository = (*Repository)(nil)
 
 type Repository struct {
 	pool *pgxpool.Pool
@@ -21,10 +22,10 @@ func New(pool *pgxpool.Pool) *Repository {
 	return &Repository{pool: pool}
 }
 
-func (r *Repository) Create(ctx context.Context, p projectsvc.Project) (projectsvc.Project, error) {
+func (r *Repository) Create(ctx context.Context, p domainproject.Project) (domainproject.Project, error) {
 	configJSON, err := json.Marshal(p.Config)
 	if err != nil {
-		return projectsvc.Project{}, fmt.Errorf("marshal config: %w", err)
+		return domainproject.Project{}, fmt.Errorf("marshal config: %w", err)
 	}
 
 	row := r.pool.QueryRow(ctx,
@@ -34,10 +35,10 @@ func (r *Repository) Create(ctx context.Context, p projectsvc.Project) (projects
 		p.ID, p.Name, p.RepoURL, configJSON, p.CreatedAt,
 	)
 
-	var out projectsvc.Project
+	var out domainproject.Project
 	var cfgBytes []byte
 	if err := row.Scan(&out.ID, &out.Name, &out.RepoURL, &cfgBytes, &out.CreatedAt); err != nil {
-		return projectsvc.Project{}, fmt.Errorf("insert project: %w", err)
+		return domainproject.Project{}, fmt.Errorf("insert project: %w", err)
 	}
 	if err := json.Unmarshal(cfgBytes, &out.Config); err != nil {
 		out.Config = map[string]interface{}{}
@@ -45,15 +46,15 @@ func (r *Repository) Create(ctx context.Context, p projectsvc.Project) (projects
 	return out, nil
 }
 
-func (r *Repository) GetByID(ctx context.Context, id uuid.UUID) (projectsvc.Project, error) {
+func (r *Repository) GetByID(ctx context.Context, id uuid.UUID) (domainproject.Project, error) {
 	row := r.pool.QueryRow(ctx,
 		`SELECT id, name, repo_url, config_json, created_at FROM projects WHERE id = $1`, id,
 	)
 
-	var out projectsvc.Project
+	var out domainproject.Project
 	var cfgBytes []byte
 	if err := row.Scan(&out.ID, &out.Name, &out.RepoURL, &cfgBytes, &out.CreatedAt); err != nil {
-		return projectsvc.Project{}, fmt.Errorf("get project: %w", err)
+		return domainproject.Project{}, fmt.Errorf("get project: %w", err)
 	}
 	if err := json.Unmarshal(cfgBytes, &out.Config); err != nil {
 		out.Config = map[string]interface{}{}

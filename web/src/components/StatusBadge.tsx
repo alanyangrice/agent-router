@@ -1,27 +1,30 @@
 "use client";
 
 const STATUS_STYLES: Record<string, string> = {
-  backlog: "bg-gray-600 text-gray-200",
-  ready: "bg-purple-600 text-purple-100",
+  backlog:     "bg-gray-600 text-gray-200",
+  ready:       "bg-purple-600 text-purple-100",
   in_progress: "bg-blue-600 text-blue-100",
-  in_review: "bg-yellow-600 text-yellow-100",
-  done: "bg-green-600 text-green-100",
-  idle: "bg-green-600 text-green-100",
-  working: "bg-blue-600 text-blue-100",
-  blocked: "bg-yellow-600 text-yellow-100",
-  offline: "bg-red-600 text-red-100",
+  in_qa:       "bg-orange-600 text-orange-100",
+  in_review:   "bg-yellow-600 text-yellow-100",
+  merged:      "bg-green-600 text-green-100",
+  // agent statuses
+  idle:        "bg-green-600 text-green-100",
+  working:     "bg-blue-600 text-blue-100",
+  blocked:     "bg-yellow-600 text-yellow-100",
+  offline:     "bg-red-600 text-red-100",
 };
 
 const STATUS_LABELS: Record<string, string> = {
-  backlog: "Backlog",
-  ready: "Ready",
+  backlog:     "Backlog",
+  ready:       "Ready",
   in_progress: "In Progress",
-  in_review: "In Review",
-  done: "Done",
-  idle: "Idle",
-  working: "Working",
-  blocked: "Blocked",
-  offline: "Offline",
+  in_qa:       "QA",
+  in_review:   "Review",
+  merged:      "Merged",
+  idle:        "Idle",
+  working:     "Working",
+  blocked:     "Blocked",
+  offline:     "Offline",
 };
 
 export function StatusBadge({ status, className = "" }: { status: string; className?: string }) {

@@ -46,36 +46,6 @@ func New(projectID uuid.UUID, role, name, model string, skills []string) Agent {
 	}
 }
 
-func (a *Agent) RecordHeartbeat() {
-	now := time.Now().UTC()
-	a.LastHeartbeatAt = &now
-}
-
-func (a *Agent) IsStale(timeout time.Duration) bool {
-	if a.LastHeartbeatAt == nil {
-		return true
-	}
-	return time.Since(*a.LastHeartbeatAt) > timeout
-}
-
-func (a *Agent) HasSkill(skill string) bool {
-	for _, s := range a.Skills {
-		if s == skill {
-			return true
-		}
-	}
-	return false
-}
-
-func (a *Agent) MatchesAnySkill(required []string) bool {
-	for _, req := range required {
-		if a.HasSkill(req) {
-			return true
-		}
-	}
-	return false
-}
-
 type ListFilters struct {
 	ProjectID *uuid.UUID
 	Role      *string
