@@ -4,39 +4,59 @@ import (
 	"github.com/alanyang/agent-mesh/internal/domain/task"
 )
 
-// StageAction defines what the service should do when a task enters a given status.
-// This drives the task service without hardcoding pipeline logic in the service itself (OCP).
+// StageAction defines what the service should do when a task enters or leaves a given status.
 type StageAction struct {
-	// AssignRole is the agent role to assign the task to. Empty means no new assignment
-	// (e.g. bouncing back to in_progress preserves the existing coder assignment).
+	// AssignRole is the agent role to assign the task to when entering this status.
+	// Empty means no new assignment.
 	AssignRole string
 
-	// BroadcastEvent is the event name to broadcast to all agents of a specific role
-	// via RoleNotifier. Empty means no broadcast.
+	// FreedRole is the agent role released when a task leaves this status.
+	// It triggers SweepUnassigned so waiting tasks get picked up immediately.
+	FreedRole string
+
+	// BroadcastEvent is the event name to broadcast on entry to this status.
 	BroadcastEvent string
+
+	// BroadcastRole is the role that receives the broadcast. Replaces the hardcoded "coder".
+	BroadcastRole string
+}
+
+// EffectiveFreedRole returns the role released when a task leaves a status.
+// If FreedRole is set explicitly it is returned as-is.
+// Otherwise it falls back to AssignRole — when the same role assigns and works
+// the status, that role is also the one freed when the task leaves.
+func (a StageAction) EffectiveFreedRole() string {
+	if a.FreedRole != "" {
+		return a.FreedRole
+	}
+	return a.AssignRole
 }
 
 // Config maps each task status to the action the service should take on entry.
 type Config map[task.Status]StageAction
 
-// DefaultConfig is the V1 three-role pipeline.
-// To add a new stage (e.g. V2 architect): extend this map — no service code changes required.
+// DefaultConfig is the V1 three-role pipeline (coder → QA → reviewer → merged).
+// V1.1: FreedRole drives sweep triggers so agents get work immediately after freeing a slot.
+// To add a new stage: extend this map — no service code changes required (OCP).
 var DefaultConfig = Config{
 	task.StatusReady: {
 		AssignRole: "coder",
 	},
 	task.StatusInProgress: {
-		// No new assignment: preserve existing coder (ownership lock).
-		// The task service is responsible for NOT clearing assigned_agent_id on this transition.
+		// No new assignment on entry — coder was already assigned at the ready stage.
+		// FreedRole: "coder" because leaving in_progress frees a coder slot.
+		FreedRole: "coder",
 	},
 	task.StatusInQA: {
 		AssignRole: "qa",
+		// FreedRole omitted: SweepUnassigned derives it from AssignRole when FreedRole is empty.
 	},
 	task.StatusInReview: {
 		AssignRole: "reviewer",
+		// FreedRole omitted: derived from AssignRole.
 	},
 	task.StatusMerged: {
-		// Terminal: no new assignment. Broadcast main_updated to all in-progress coders.
 		BroadcastEvent: "main_updated",
+		BroadcastRole:  "coder",
 	},
 }

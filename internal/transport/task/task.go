@@ -2,6 +2,7 @@ package task
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -123,7 +124,17 @@ func updateTaskStatus(svc *tasksvc.Service) gin.HandlerFunc {
 		}
 
 		if err := svc.UpdateStatus(c.Request.Context(), id, req.StatusFrom, req.StatusTo); err != nil {
-			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			msg := err.Error()
+			switch {
+			case strings.Contains(msg, "invalid transition"),
+				strings.Contains(msg, "CAS failed"),
+				strings.Contains(msg, "terminal status"):
+				c.JSON(http.StatusConflict, gin.H{"error": msg})
+			case strings.Contains(msg, "not found"):
+				c.JSON(http.StatusNotFound, gin.H{"error": msg})
+			default:
+				c.JSON(http.StatusInternalServerError, gin.H{"error": msg})
+			}
 			return
 		}
 

@@ -16,7 +16,6 @@ import (
 )
 
 // Service manages agent lifecycle: registration, status, and orphan recovery.
-// [SRP] Agent lifecycle only. Reaper scheduling is the MCP server's responsibility.
 type Service struct {
 	repo     portagent.Repository
 	taskRepo porttask.Repository
@@ -60,7 +59,6 @@ func (s *Service) List(ctx context.Context, filters domainagent.ListFilters) ([]
 
 // Reactivate marks an existing agent as idle and publishes TypeAgentOnline.
 // Called when an agent reconnects with a previously-issued agent_id.
-// Returns an error if the agent does not exist — the caller should fall back to Register.
 func (s *Service) Reactivate(ctx context.Context, agentID uuid.UUID) (domainagent.Agent, error) {
 	a, err := s.repo.GetByID(ctx, agentID)
 	if err != nil {
@@ -77,41 +75,63 @@ func (s *Service) Reactivate(ctx context.Context, agentID uuid.UUID) (domainagen
 }
 
 // ReapOrphaned is called by the MCP server when an agent's SSE session closes.
-// It marks the agent offline and recovers any orphaned tasks.
-// [SRP] This is the agent service's only lifecycle responsibility outside registration.
+// It marks the agent offline and releases only ready tasks (assigned but never started).
+// In-flight tasks (in_progress, in_qa, in_review) are handled by the grace-period timer
+// in wire/app.go via ReleaseAgent — giving the agent a window to reconnect first.
 func (s *Service) ReapOrphaned(ctx context.Context, agentID uuid.UUID) {
-	a, err := s.repo.GetByID(ctx, agentID)
-	if err != nil {
-		slog.ErrorContext(ctx, "reap: agent not found", "agent_id", agentID, "error", err)
-		return
-	}
-
 	if err := s.repo.UpdateStatus(ctx, agentID, domainagent.StatusOffline); err != nil {
 		slog.ErrorContext(ctx, "reap: failed to mark agent offline", "agent_id", agentID, "error", err)
 		return
 	}
 
-	// Reset any in-progress task back to ready so another agent can pick it up.
-	if a.CurrentTaskID != nil {
-		if err := s.taskRepo.UpdateStatus(ctx, *a.CurrentTaskID, domaintask.StatusInProgress, domaintask.StatusReady); err != nil {
-			slog.ErrorContext(ctx, "reap: failed to reset in-progress task", "task_id", *a.CurrentTaskID, "error", err)
-		}
-		if err := s.taskRepo.Unassign(ctx, *a.CurrentTaskID); err != nil {
-			slog.ErrorContext(ctx, "reap: failed to unassign task", "task_id", *a.CurrentTaskID, "error", err)
-		}
-		if err := s.repo.SetCurrentTask(ctx, agentID, nil); err != nil {
-			slog.ErrorContext(ctx, "reap: failed to clear current task", "agent_id", agentID, "error", err)
-		}
-	}
-
-	// Also release any ready tasks that were assigned but never started.
+	// Release only ready tasks — in-flight tasks are preserved for the grace period.
 	if err := s.taskRepo.UnassignByAgent(ctx, agentID); err != nil {
-		slog.ErrorContext(ctx, "reap: failed to unassign ready tasks", "agent_id", agentID, "error", err)
+		slog.ErrorContext(ctx, "reap: failed to release ready tasks", "agent_id", agentID, "error", err)
 	}
 
 	if err := s.bus.Publish(ctx, event.New(event.TypeAgentOffline, agentID)); err != nil {
-		slog.ErrorContext(ctx, "reap: failed to publish AgentOffline event", "agent_id", agentID, "error", err)
+		slog.ErrorContext(ctx, "reap: failed to publish AgentOffline", "agent_id", agentID, "error", err)
 	}
 
-	slog.InfoContext(ctx, "reap: agent session closed, tasks recovered", "agent_id", agentID)
+	slog.InfoContext(ctx, "reap: agent session closed", "agent_id", agentID)
+}
+
+// SetIdle marks an agent idle with no current task.
+// Called from claim_task when it returns null — the agent has no work to do.
+func (s *Service) SetIdle(ctx context.Context, agentID uuid.UUID) {
+	if err := s.repo.SetIdleStatus(ctx, agentID); err != nil {
+		slog.ErrorContext(ctx, "set idle: failed", "agent_id", agentID, "error", err)
+	}
+}
+
+// SetWorking marks an agent as working on a specific task.
+// Called from claim_task as a safety net — ensures correct status even when assignments
+// arrive via bounce-back (repo.Assign) rather than through ClaimAgent.
+func (s *Service) SetWorking(ctx context.Context, agentID, taskID uuid.UUID) {
+	if err := s.repo.SetWorkingStatus(ctx, agentID, taskID); err != nil {
+		slog.ErrorContext(ctx, "set working: failed", "agent_id", agentID, "task_id", taskID, "error", err)
+	}
+}
+
+// ReleaseAgent is called by the grace-period reaper after the timer expires.
+// It checks the agent is still offline (guard against reconnect during grace period),
+// then releases in-flight tasks and returns the freed statuses and the agent's projectID
+// so the caller can sweep the correct roles without a second GetByID call.
+func (s *Service) ReleaseAgent(ctx context.Context, agentID uuid.UUID) (uuid.UUID, []domaintask.Status, error) {
+	a, err := s.repo.GetByID(ctx, agentID)
+	if err != nil {
+		return uuid.Nil, nil, fmt.Errorf("release: agent not found: %w", err)
+	}
+	if a.Status != domainagent.StatusOffline {
+		// Agent reconnected during grace period — nothing to release.
+		return uuid.Nil, nil, nil
+	}
+	freed, err := s.taskRepo.ReleaseInFlightByAgent(ctx, agentID)
+	return a.ProjectID, freed, err
+}
+
+// ListOfflineWithInflightTasks returns IDs of offline agents that still have in-flight tasks.
+// Used on startup to reschedule reaper timers lost during a process restart.
+func (s *Service) ListOfflineWithInflightTasks(ctx context.Context) ([]uuid.UUID, error) {
+	return s.repo.ListOfflineWithInflightTasks(ctx)
 }

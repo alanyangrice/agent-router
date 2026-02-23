@@ -11,7 +11,6 @@ type Status string
 const (
 	StatusIdle    Status = "idle"
 	StatusWorking Status = "working"
-	StatusBlocked Status = "blocked"
 	StatusOffline Status = "offline"
 )
 

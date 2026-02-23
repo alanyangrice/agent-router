@@ -60,6 +60,7 @@ type Task struct {
 	Status          Status     `json:"status"`
 	Priority        Priority   `json:"priority"`
 	AssignedAgentID *uuid.UUID `json:"assigned_agent_id,omitempty"`
+	CoderID         *uuid.UUID `json:"coder_id,omitempty"` // original coder — preserved for bounce-back routing
 	ParentTaskID    *uuid.UUID `json:"parent_task_id,omitempty"`
 	BranchType      BranchType `json:"branch_type"`
 	BranchName      string     `json:"branch_name"`
@@ -96,9 +97,11 @@ type Dependency struct {
 }
 
 type ListFilters struct {
-	ProjectID  *uuid.UUID
-	Status     *Status
-	Priority   *Priority
-	AssignedTo *uuid.UUID
-	Labels     []string
+	ProjectID   *uuid.UUID
+	Status      *Status
+	Priority    *Priority
+	AssignedTo  *uuid.UUID
+	Labels      []string
+	Unassigned  bool // WHERE assigned_agent_id IS NULL
+	OldestFirst bool // ORDER BY created_at ASC (default is DESC)
 }
