@@ -21,6 +21,17 @@ type StageAction struct {
 	BroadcastRole string
 }
 
+// EffectiveFreedRole returns the role released when a task leaves a status.
+// If FreedRole is set explicitly it is returned as-is.
+// Otherwise it falls back to AssignRole — when the same role assigns and works
+// the status, that role is also the one freed when the task leaves.
+func (a StageAction) EffectiveFreedRole() string {
+	if a.FreedRole != "" {
+		return a.FreedRole
+	}
+	return a.AssignRole
+}
+
 // Config maps each task status to the action the service should take on entry.
 type Config map[task.Status]StageAction
 
@@ -38,11 +49,11 @@ var DefaultConfig = Config{
 	},
 	task.StatusInQA: {
 		AssignRole: "qa",
-		FreedRole:  "qa", // leaving in_qa frees a qa slot
+		// FreedRole omitted: SweepUnassigned derives it from AssignRole when FreedRole is empty.
 	},
 	task.StatusInReview: {
 		AssignRole: "reviewer",
-		FreedRole:  "reviewer",
+		// FreedRole omitted: derived from AssignRole.
 	},
 	task.StatusMerged: {
 		BroadcastEvent: "main_updated",

@@ -153,13 +153,15 @@ func (s *Service) UpdateStatus(ctx context.Context, id uuid.UUID, from, to domai
 		}
 
 		// Sweep for the freed QA/reviewer slot — BEFORE return so it is never lost.
-		if fromAction, ok := s.pipelineConfig[from]; ok && fromAction.FreedRole != "" {
-			role, projectID := fromAction.FreedRole, t.ProjectID
-			go func() {
-				if err := s.SweepUnassigned(context.Background(), projectID, role); err != nil {
-					slog.Error("sweep failed after bounce-back", "role", role, "error", err)
-				}
-			}()
+		if fromAction, ok := s.pipelineConfig[from]; ok {
+			if role := fromAction.EffectiveFreedRole(); role != "" {
+				projectID := t.ProjectID
+				go func() {
+					if err := s.SweepUnassigned(context.Background(), projectID, role); err != nil {
+						slog.Error("sweep failed after bounce-back", "role", role, "error", err)
+					}
+				}()
+			}
 		}
 
 		return nil // skip normal AssignRole/BroadcastEvent/TypeTaskCompleted
@@ -189,15 +191,17 @@ func (s *Service) UpdateStatus(ctx context.Context, id uuid.UUID, from, to domai
 	}
 
 	// ── FreedRole sweep: fire when leaving `from` status ─────────────────────────────
-	// pipelineConfig[from].FreedRole names the role that was doing `from` work.
+	// EffectiveFreedRole() returns FreedRole if set, else falls back to AssignRole.
 	// Using context.Background() so the goroutine outlives the request context.
-	if fromAction, ok := s.pipelineConfig[from]; ok && fromAction.FreedRole != "" {
-		role, projectID := fromAction.FreedRole, t.ProjectID
-		go func() {
-			if err := s.SweepUnassigned(context.Background(), projectID, role); err != nil {
-				slog.Error("sweep failed after status transition", "role", role, "error", err)
-			}
-		}()
+	if fromAction, ok := s.pipelineConfig[from]; ok {
+		if role := fromAction.EffectiveFreedRole(); role != "" {
+			projectID := t.ProjectID
+			go func() {
+				if err := s.SweepUnassigned(context.Background(), projectID, role); err != nil {
+					slog.Error("sweep failed after status transition", "role", role, "error", err)
+				}
+			}()
+		}
 	}
 
 	// ── BroadcastEvent: notify a role (independent of AssignRole) ────────────────────
@@ -226,7 +230,9 @@ func (s *Service) SweepUnassigned(ctx context.Context, projectID uuid.UUID, role
 	key := advisoryKey(projectID, role)
 	return s.locker.WithLock(ctx, key, func(ctx context.Context) error {
 		for status, action := range s.pipelineConfig {
-			if action.AssignRole != role {
+			// Match on AssignRole (normal assignment path) OR FreedRole (recovery path
+			// for tasks stranded unassigned — e.g. in_progress after a failed bounce-back).
+			if action.AssignRole != role && action.FreedRole != role {
 				continue
 			}
 			tasks, err := s.repo.List(ctx, domaintask.ListFilters{

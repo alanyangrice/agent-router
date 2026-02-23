@@ -47,13 +47,14 @@ func startReaper(ctx context.Context, app *App, bus porteventbus.EventBus) {
 				return
 			}
 			for _, status := range freedStatuses {
-				if action, ok := pipeline.DefaultConfig[status]; ok && action.FreedRole != "" {
-					role := action.FreedRole
-					go func() {
-						if err := app.TaskSvc.SweepUnassigned(context.Background(), projectID, role); err != nil {
-							slog.Error("reaper: sweep failed after release", "role", role, "error", err)
-						}
-					}()
+				if action, ok := pipeline.DefaultConfig[status]; ok {
+					if role := action.EffectiveFreedRole(); role != "" {
+						go func() {
+							if err := app.TaskSvc.SweepUnassigned(context.Background(), projectID, role); err != nil {
+								slog.Error("reaper: sweep failed after release", "role", role, "error", err)
+							}
+						}()
+					}
 				}
 			}
 		})
