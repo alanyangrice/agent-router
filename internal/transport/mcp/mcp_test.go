@@ -13,51 +13,114 @@ import (
 	mcptransport "github.com/alanyang/agent-mesh/internal/transport/mcp"
 )
 
-// ── Registry unit tests (no DB required) ─────────────────────────────────────
+// ── Registry ──────────────────────────────────────────────────────────────────
 
-func TestRegistry_RegisterUnregister(t *testing.T) {
-	reg := mcptransport.NewSessionRegistry()
+func TestRegistry(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(t *testing.T)
+	}{
+		{
+			name: "register then unregister removes agent",
+			run: func(t *testing.T) {
+				reg := mcptransport.NewSessionRegistry()
+				agentID := uuid.New()
+				projectID := uuid.New()
 
-	agentID := uuid.New()
-	projectID := uuid.New()
-	sessionID := "session-1"
+				reg.Register("session-1", agentID, projectID, "coder")
+				assert.True(t, reg.IsConnected(agentID), "agent should be connected after register")
 
-	reg.Register(sessionID, agentID, projectID, "coder")
+				got, ok := reg.Unregister("session-1")
+				assert.True(t, ok, "unregister should succeed")
+				assert.Equal(t, agentID, got)
+				assert.False(t, reg.IsConnected(agentID), "agent should not be connected after unregister")
+			},
+		},
+		{
+			name: "re-registering agent with new session replaces old session",
+			run: func(t *testing.T) {
+				reg := mcptransport.NewSessionRegistry()
+				agentID := uuid.New()
+				projectID := uuid.New()
 
-	assert.True(t, reg.IsConnected(agentID), "agent should be connected after register")
+				reg.Register("session-old", agentID, projectID, "coder")
+				reg.Register("session-new", agentID, projectID, "coder")
 
-	got, ok := reg.Unregister(sessionID)
-	assert.True(t, ok, "unregister should succeed")
-	assert.Equal(t, agentID, got, "unregistered agent ID should match")
-	assert.False(t, reg.IsConnected(agentID), "agent should not be connected after unregister")
+				// Old session is no longer valid.
+				got, ok := reg.Unregister("session-old")
+				assert.False(t, ok, "old session should not exist after re-register")
+				assert.Equal(t, uuid.Nil, got)
+
+				// New session still active.
+				assert.True(t, reg.IsConnected(agentID))
+			},
+		},
+		{
+			name: "unregister non-existent session returns nil, false",
+			run: func(t *testing.T) {
+				reg := mcptransport.NewSessionRegistry()
+				got, ok := reg.Unregister("does-not-exist")
+				assert.False(t, ok)
+				assert.Equal(t, uuid.Nil, got)
+			},
+		},
+		{
+			name: "session close unregisters agent — orphan recovery simulation",
+			run: func(t *testing.T) {
+				reg := mcptransport.NewSessionRegistry()
+				agentID := uuid.New()
+				reg.Register("session-drop", agentID, uuid.New(), "coder")
+				assert.True(t, reg.IsConnected(agentID))
+
+				recovered, ok := reg.Unregister("session-drop")
+				assert.True(t, ok)
+				assert.Equal(t, agentID, recovered)
+				assert.False(t, reg.IsConnected(agentID))
+			},
+		},
+		{
+			name: "agent can reconnect after disconnect",
+			run: func(t *testing.T) {
+				reg := mcptransport.NewSessionRegistry()
+				agentID := uuid.New()
+				projectID := uuid.New()
+
+				reg.Register("session-1", agentID, projectID, "coder")
+				assert.True(t, reg.IsConnected(agentID))
+
+				reg.Unregister("session-1")
+				assert.False(t, reg.IsConnected(agentID))
+
+				reg.Register("session-2", agentID, projectID, "coder")
+				assert.True(t, reg.IsConnected(agentID), "agent should be connected after reconnect")
+			},
+		},
+		{
+			name: "NotifyAgent for disconnected agent is a no-op",
+			run: func(t *testing.T) {
+				reg := mcptransport.NewSessionRegistry()
+				err := reg.NotifyAgent(context.Background(), uuid.New(), map[string]string{"event": "test"})
+				assert.NoError(t, err)
+			},
+		},
+		{
+			name: "NotifyProjectRole with no sessions is a no-op",
+			run: func(t *testing.T) {
+				reg := mcptransport.NewSessionRegistry()
+				err := reg.NotifyProjectRole(context.Background(), uuid.New(), "coder", map[string]string{"event": "main_updated"})
+				assert.NoError(t, err)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.run(t)
+		})
+	}
 }
 
-func TestRegistry_RegisterOverwritesPreviousSession(t *testing.T) {
-	reg := mcptransport.NewSessionRegistry()
-
-	agentID := uuid.New()
-	projectID := uuid.New()
-
-	reg.Register("session-old", agentID, projectID, "coder")
-	reg.Register("session-new", agentID, projectID, "coder")
-
-	// Old session should no longer be tracked.
-	got, ok := reg.Unregister("session-old")
-	assert.False(t, ok, "old session should not exist after re-register")
-	assert.Equal(t, uuid.Nil, got)
-
-	// New session is still there.
-	assert.True(t, reg.IsConnected(agentID))
-}
-
-func TestRegistry_UnregisterNonExistentSession(t *testing.T) {
-	reg := mcptransport.NewSessionRegistry()
-	got, ok := reg.Unregister("does-not-exist")
-	assert.False(t, ok)
-	assert.Equal(t, uuid.Nil, got)
-}
-
-// ── Pipeline domain tests (no DB required) ────────────────────────────────────
+// ── Pipeline (already table-driven — preserved as-is) ─────────────────────────
 
 func TestPipeline_DefaultConfig_Transitions(t *testing.T) {
 	cfg := pipeline.DefaultConfig
@@ -109,33 +172,16 @@ func TestPipeline_ValidTransitions(t *testing.T) {
 	}
 }
 
-// ── Notification tests ────────────────────────────────────────────────────────
+// ── Skipped integration tests (require running server) ────────────────────────
 
-func TestRegistry_NotifyAgent_NoOpWhenNotConnected(t *testing.T) {
-	reg := mcptransport.NewSessionRegistry()
-	// No mcpSrv set, but agent not connected → should return nil
-	err := reg.NotifyAgent(context.Background(), uuid.New(), map[string]string{"event": "test"})
-	assert.NoError(t, err, "NotifyAgent for disconnected agent should be a no-op")
-}
-
-func TestRegistry_NotifyProjectRole_NoOpWithNoConnections(t *testing.T) {
-	reg := mcptransport.NewSessionRegistry()
-	err := reg.NotifyProjectRole(context.Background(), uuid.New(), "coder", map[string]string{"event": "main_updated"})
-	assert.NoError(t, err, "NotifyProjectRole with no sessions should be a no-op")
-}
-
-// ── Integration tests (require DATABASE_URL) ──────────────────────────────────
-// These tests are skipped unless DATABASE_URL is set and a running server is available.
-//
-// To run: DATABASE_URL=postgres://... go test ./internal/transport/mcp/... -tags integration
-
-// TestHappyPath exercises the full coder → QA → reviewer pipeline via REST status transitions.
-// The MCP tools layer is tested separately by the Python simulation script.
+// TestHappyPath exercises the full coder → QA → reviewer pipeline via REST.
+// Run via: scripts/test_v1_rest.sh
 func TestHappyPath(t *testing.T) {
 	t.Skip("Requires running server — run via scripts/test_v1_rest.sh")
 }
 
-// TestOwnershipLock verifies assigned_agent_id is preserved when QA bounces a task back.
+// TestOwnershipLock verifies assigned_agent_id is preserved when QA bounces back.
+// Run via: agents/example/simulate_pipeline.py
 func TestOwnershipLock(t *testing.T) {
 	t.Skip("Requires running server — run via agents/example/simulate_pipeline.py")
 }
@@ -150,43 +196,7 @@ func TestMainUpdatedNotification(t *testing.T) {
 	t.Skip("Requires running server — run via agents/example/simulate_pipeline.py")
 }
 
-// TestOrphanedTaskRecovery verifies that when a session closes, the task is reset to ready.
-func TestOrphanedTaskRecovery(t *testing.T) {
-	reg := mcptransport.NewSessionRegistry()
-
-	agentID := uuid.New()
-	projectID := uuid.New()
-	reg.Register("session-drop", agentID, projectID, "coder")
-	assert.True(t, reg.IsConnected(agentID))
-
-	// Simulate session close
-	recovered, ok := reg.Unregister("session-drop")
-	assert.True(t, ok)
-	assert.Equal(t, agentID, recovered)
-	assert.False(t, reg.IsConnected(agentID))
-}
-
-// TestReconnect verifies an agent can re-register with the same agent_id.
-func TestReconnect(t *testing.T) {
-	reg := mcptransport.NewSessionRegistry()
-	agentID := uuid.New()
-	projectID := uuid.New()
-
-	reg.Register("session-1", agentID, projectID, "coder")
-	assert.True(t, reg.IsConnected(agentID))
-
-	// Simulate disconnect
-	reg.Unregister("session-1")
-	assert.False(t, reg.IsConnected(agentID))
-
-	// Reconnect with new session
-	reg.Register("session-2", agentID, projectID, "coder")
-	assert.True(t, reg.IsConnected(agentID), "agent should be connected after reconnect")
-}
-
 // TestPromptFallback verifies global default is returned when no project-specific prompt exists.
-// This is tested at the adapter level via adapter/postgres/prompt.
 func TestPromptFallback(t *testing.T) {
 	t.Skip("Requires running Postgres — run via scripts/test_v1_rest.sh")
 }
-

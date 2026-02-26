@@ -22,60 +22,128 @@ func newPromptSvc(t *testing.T) (*promptsvc.Service, *mocks.MockPromptRepository
 	return promptsvc.NewService(repo), repo
 }
 
-func TestGetForRole_Success(t *testing.T) {
-	svc, repo := newPromptSvc(t)
-	projectID := uuid.New()
-	expected := domainprompt.RolePrompt{Role: "coder", Content: "You are a coder"}
-	repo.EXPECT().GetForRole(gomock.Any(), &projectID, "coder").Return(expected, nil)
+func TestGetForRole(t *testing.T) {
+	tests := []struct {
+		name    string
+		setup   func(repo *mocks.MockPromptRepository, projectID uuid.UUID)
+		wantErr bool
+		wantMsg string
+	}{
+		{
+			name: "success",
+			setup: func(repo *mocks.MockPromptRepository, projectID uuid.UUID) {
+				repo.EXPECT().GetForRole(gomock.Any(), &projectID, "coder").
+					Return(domainprompt.RolePrompt{Role: "coder", Content: "You are a coder"}, nil)
+			},
+		},
+		{
+			name: "repo error",
+			setup: func(repo *mocks.MockPromptRepository, projectID uuid.UUID) {
+				repo.EXPECT().GetForRole(gomock.Any(), gomock.Any(), gomock.Any()).
+					Return(domainprompt.RolePrompt{}, errors.New("db error"))
+			},
+			wantErr: true,
+			wantMsg: "get role prompt",
+		},
+	}
 
-	got, err := svc.GetForRole(context.Background(), projectID, "coder")
-	require.NoError(t, err)
-	assert.Equal(t, "coder", got.Role)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, repo := newPromptSvc(t)
+			projectID := uuid.New()
+			tt.setup(repo, projectID)
+
+			got, err := svc.GetForRole(context.Background(), projectID, "coder")
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantMsg)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, "coder", got.Role)
+		})
+	}
 }
 
-func TestGetForRole_Error(t *testing.T) {
-	svc, repo := newPromptSvc(t)
-	repo.EXPECT().GetForRole(gomock.Any(), gomock.Any(), gomock.Any()).Return(domainprompt.RolePrompt{}, errors.New("db error"))
+func TestSet(t *testing.T) {
+	tests := []struct {
+		name    string
+		setup   func(repo *mocks.MockPromptRepository)
+		wantErr bool
+		wantMsg string
+	}{
+		{
+			name: "success",
+			setup: func(repo *mocks.MockPromptRepository) {
+				repo.EXPECT().Set(gomock.Any(), gomock.Any()).Return(nil)
+			},
+		},
+		{
+			name: "repo error",
+			setup: func(repo *mocks.MockPromptRepository) {
+				repo.EXPECT().Set(gomock.Any(), gomock.Any()).Return(errors.New("db error"))
+			},
+			wantErr: true,
+			wantMsg: "set role prompt",
+		},
+	}
 
-	_, err := svc.GetForRole(context.Background(), uuid.New(), "coder")
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "get role prompt")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, repo := newPromptSvc(t)
+			tt.setup(repo)
+
+			err := svc.Set(context.Background(), uuid.New(), "coder", "You are a coder")
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantMsg)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
 }
 
-func TestSet_Success(t *testing.T) {
-	svc, repo := newPromptSvc(t)
-	projectID := uuid.New()
-	repo.EXPECT().Set(gomock.Any(), gomock.Any()).Return(nil)
+func TestList(t *testing.T) {
+	tests := []struct {
+		name     string
+		setup    func(repo *mocks.MockPromptRepository, projectID uuid.UUID)
+		wantLen  int
+		wantErr  bool
+		wantMsg  string
+	}{
+		{
+			name: "success returns all prompts",
+			setup: func(repo *mocks.MockPromptRepository, projectID uuid.UUID) {
+				repo.EXPECT().List(gomock.Any(), projectID).
+					Return([]domainprompt.RolePrompt{{Role: "coder"}, {Role: "qa"}}, nil)
+			},
+			wantLen: 2,
+		},
+		{
+			name: "repo error",
+			setup: func(repo *mocks.MockPromptRepository, projectID uuid.UUID) {
+				repo.EXPECT().List(gomock.Any(), gomock.Any()).Return(nil, errors.New("db error"))
+			},
+			wantErr: true,
+			wantMsg: "list role prompts",
+		},
+	}
 
-	err := svc.Set(context.Background(), projectID, "coder", "You are a coder")
-	require.NoError(t, err)
-}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, repo := newPromptSvc(t)
+			projectID := uuid.New()
+			tt.setup(repo, projectID)
 
-func TestSet_Error(t *testing.T) {
-	svc, repo := newPromptSvc(t)
-	repo.EXPECT().Set(gomock.Any(), gomock.Any()).Return(errors.New("db error"))
-
-	err := svc.Set(context.Background(), uuid.New(), "coder", "content")
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "set role prompt")
-}
-
-func TestList_Success(t *testing.T) {
-	svc, repo := newPromptSvc(t)
-	projectID := uuid.New()
-	expected := []domainprompt.RolePrompt{{Role: "coder"}, {Role: "qa"}}
-	repo.EXPECT().List(gomock.Any(), projectID).Return(expected, nil)
-
-	got, err := svc.List(context.Background(), projectID)
-	require.NoError(t, err)
-	assert.Len(t, got, 2)
-}
-
-func TestList_Error(t *testing.T) {
-	svc, repo := newPromptSvc(t)
-	repo.EXPECT().List(gomock.Any(), gomock.Any()).Return(nil, errors.New("db error"))
-
-	_, err := svc.List(context.Background(), uuid.New())
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "list role prompts")
+			got, err := svc.List(context.Background(), projectID)
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantMsg)
+				return
+			}
+			require.NoError(t, err)
+			assert.Len(t, got, tt.wantLen)
+		})
+	}
 }

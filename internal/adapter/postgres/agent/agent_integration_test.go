@@ -21,11 +21,16 @@ import (
 	"github.com/alanyang/agent-mesh/internal/testutil"
 )
 
-// helpers
+// ── helpers ───────────────────────────────────────────────────────────────────
 
 func setupProject(t *testing.T, ctx context.Context, projRepo *pgproject.Repository) domainproject.Project {
 	t.Helper()
-	p := domainproject.Project{ID: uuid.New(), Name: "agent-test-" + uuid.New().String()[:8], RepoURL: "https://github.com/x", Config: map[string]interface{}{}}
+	p := domainproject.Project{
+		ID:      uuid.New(),
+		Name:    "agent-test-" + uuid.New().String()[:8],
+		RepoURL: "https://github.com/x",
+		Config:  map[string]interface{}{},
+	}
 	created, err := projRepo.Create(ctx, p)
 	require.NoError(t, err)
 	return created
@@ -50,20 +55,17 @@ func setupTask(t *testing.T, ctx context.Context, taskRepo *pgtask.Repository, p
 	created, err := taskRepo.Create(ctx, task)
 	require.NoError(t, err)
 	if status != domaintask.StatusBacklog {
-		from := domaintask.StatusBacklog
-		to := domaintask.StatusReady
-		require.NoError(t, taskRepo.UpdateStatus(ctx, created.ID, from, to))
-		if status == domaintask.StatusInProgress {
+		require.NoError(t, taskRepo.UpdateStatus(ctx, created.ID, domaintask.StatusBacklog, domaintask.StatusReady))
+		switch status {
+		case domaintask.StatusInProgress:
 			require.NoError(t, taskRepo.UpdateStatus(ctx, created.ID, domaintask.StatusReady, domaintask.StatusInProgress))
-		} else if status == domaintask.StatusInQA {
+		case domaintask.StatusInQA:
 			require.NoError(t, taskRepo.UpdateStatus(ctx, created.ID, domaintask.StatusReady, domaintask.StatusInProgress))
 			require.NoError(t, taskRepo.UpdateStatus(ctx, created.ID, domaintask.StatusInProgress, domaintask.StatusInQA))
-		} else if status == domaintask.StatusInReview {
+		case domaintask.StatusInReview:
 			require.NoError(t, taskRepo.UpdateStatus(ctx, created.ID, domaintask.StatusReady, domaintask.StatusInProgress))
 			require.NoError(t, taskRepo.UpdateStatus(ctx, created.ID, domaintask.StatusInProgress, domaintask.StatusInQA))
 			require.NoError(t, taskRepo.UpdateStatus(ctx, created.ID, domaintask.StatusInQA, domaintask.StatusInReview))
-		} else if status == domaintask.StatusReady {
-			// already done
 		}
 		created.Status = status
 	}
@@ -147,163 +149,167 @@ func TestAgentRepo_SetIdleStatus(t *testing.T) {
 	assert.Nil(t, got.CurrentTaskID)
 }
 
-func TestAgentRepo_ClaimAgent_ExcludesWorking(t *testing.T) {
-	pool := testutil.SetupTestDB(t)
-	ctx := context.Background()
-	projRepo := pgproject.New(pool)
-	agentRepo := pgagent.New(pool)
-	taskRepo := pgtask.New(pool)
-	proj := setupProject(t, ctx, projRepo)
+func TestAgentRepo_ClaimAgent(t *testing.T) {
+	t.Run("excludes working agents", func(t *testing.T) {
+		pool := testutil.SetupTestDB(t)
+		ctx := context.Background()
+		projRepo := pgproject.New(pool)
+		agentRepo := pgagent.New(pool)
+		taskRepo := pgtask.New(pool)
+		proj := setupProject(t, ctx, projRepo)
 
-	idleAgent := setupAgent(t, ctx, agentRepo, proj.ID, "coder", domainagent.StatusIdle)
-	workingAgent := setupAgent(t, ctx, agentRepo, proj.ID, "coder", domainagent.StatusIdle)
-	task := setupTask(t, ctx, taskRepo, proj.ID, domaintask.StatusReady)
-	require.NoError(t, agentRepo.SetWorkingStatus(ctx, workingAgent.ID, task.ID))
+		idleAgent := setupAgent(t, ctx, agentRepo, proj.ID, "coder", domainagent.StatusIdle)
+		workingAgent := setupAgent(t, ctx, agentRepo, proj.ID, "coder", domainagent.StatusIdle)
+		task := setupTask(t, ctx, taskRepo, proj.ID, domaintask.StatusReady)
+		require.NoError(t, agentRepo.SetWorkingStatus(ctx, workingAgent.ID, task.ID))
 
-	claimedID, err := agentRepo.ClaimAgent(ctx, proj.ID, "coder")
-	require.NoError(t, err)
-	assert.Equal(t, idleAgent.ID, claimedID, "working agent must be excluded from ClaimAgent")
+		claimedID, err := agentRepo.ClaimAgent(ctx, proj.ID, "coder")
+		require.NoError(t, err)
+		assert.Equal(t, idleAgent.ID, claimedID, "working agent must be excluded")
+	})
+
+	t.Run("excludes offline agents", func(t *testing.T) {
+		pool := testutil.SetupTestDB(t)
+		ctx := context.Background()
+		projRepo := pgproject.New(pool)
+		agentRepo := pgagent.New(pool)
+		proj := setupProject(t, ctx, projRepo)
+
+		idleAgent := setupAgent(t, ctx, agentRepo, proj.ID, "coder", domainagent.StatusIdle)
+		_ = setupAgent(t, ctx, agentRepo, proj.ID, "coder", domainagent.StatusOffline)
+
+		claimedID, err := agentRepo.ClaimAgent(ctx, proj.ID, "coder")
+		require.NoError(t, err)
+		assert.Equal(t, idleAgent.ID, claimedID, "offline agent must be excluded")
+	})
+
+	t.Run("returns ErrNoAgentAvailable when none exist", func(t *testing.T) {
+		pool := testutil.SetupTestDB(t)
+		ctx := context.Background()
+		projRepo := pgproject.New(pool)
+		proj := setupProject(t, ctx, projRepo)
+		repo := pgagent.New(pool)
+
+		_, err := repo.ClaimAgent(ctx, proj.ID, "coder")
+		require.Error(t, err)
+		assert.ErrorIs(t, err, distributor.ErrNoAgentAvailable)
+	})
+
+	t.Run("FIFO — oldest idle agent claimed first", func(t *testing.T) {
+		pool := testutil.SetupTestDB(t)
+		ctx := context.Background()
+		projRepo := pgproject.New(pool)
+		agentRepo := pgagent.New(pool)
+		proj := setupProject(t, ctx, projRepo)
+
+		first := setupAgent(t, ctx, agentRepo, proj.ID, "coder", domainagent.StatusIdle)
+		time.Sleep(2 * time.Millisecond)
+		_ = setupAgent(t, ctx, agentRepo, proj.ID, "coder", domainagent.StatusIdle)
+
+		claimedID, err := agentRepo.ClaimAgent(ctx, proj.ID, "coder")
+		require.NoError(t, err)
+		assert.Equal(t, first.ID, claimedID, "oldest idle agent should be claimed first (FIFO)")
+	})
 }
 
-func TestAgentRepo_ClaimAgent_ExcludesOffline(t *testing.T) {
-	pool := testutil.SetupTestDB(t)
-	ctx := context.Background()
-	projRepo := pgproject.New(pool)
-	agentRepo := pgagent.New(pool)
-	proj := setupProject(t, ctx, projRepo)
+func TestAgentRepo_AssignIfIdle(t *testing.T) {
+	t.Run("idle agent — returns true and marks working", func(t *testing.T) {
+		pool := testutil.SetupTestDB(t)
+		ctx := context.Background()
+		projRepo := pgproject.New(pool)
+		agentRepo := pgagent.New(pool)
+		taskRepo := pgtask.New(pool)
+		proj := setupProject(t, ctx, projRepo)
 
-	idleAgent := setupAgent(t, ctx, agentRepo, proj.ID, "coder", domainagent.StatusIdle)
-	_ = setupAgent(t, ctx, agentRepo, proj.ID, "coder", domainagent.StatusOffline)
+		agent := setupAgent(t, ctx, agentRepo, proj.ID, "coder", domainagent.StatusIdle)
+		task := setupTask(t, ctx, taskRepo, proj.ID, domaintask.StatusInQA)
 
-	claimedID, err := agentRepo.ClaimAgent(ctx, proj.ID, "coder")
-	require.NoError(t, err)
-	assert.Equal(t, idleAgent.ID, claimedID, "offline agent must be excluded")
-}
+		ok, err := taskRepo.AssignIfIdle(ctx, task.ID, agent.ID)
+		require.NoError(t, err)
+		assert.True(t, ok, "AssignIfIdle must return true for idle agent")
 
-func TestAgentRepo_ClaimAgent_ZeroAgents(t *testing.T) {
-	pool := testutil.SetupTestDB(t)
-	ctx := context.Background()
-	projRepo := pgproject.New(pool)
-	proj := setupProject(t, ctx, projRepo)
-	repo := pgagent.New(pool)
+		gotAgent, err := agentRepo.GetByID(ctx, agent.ID)
+		require.NoError(t, err)
+		assert.Equal(t, domainagent.StatusWorking, gotAgent.Status)
 
-	_, err := repo.ClaimAgent(ctx, proj.ID, "coder")
-	require.Error(t, err)
-	assert.ErrorIs(t, err, distributor.ErrNoAgentAvailable)
-}
+		gotTask, err := taskRepo.GetByID(ctx, task.ID)
+		require.NoError(t, err)
+		require.NotNil(t, gotTask.AssignedAgentID)
+		assert.Equal(t, agent.ID, *gotTask.AssignedAgentID)
+	})
 
-func TestAgentRepo_AssignIfIdle_AgentIdle(t *testing.T) {
-	pool := testutil.SetupTestDB(t)
-	ctx := context.Background()
-	projRepo := pgproject.New(pool)
-	agentRepo := pgagent.New(pool)
-	taskRepo := pgtask.New(pool)
-	proj := setupProject(t, ctx, projRepo)
+	t.Run("working agent — returns false", func(t *testing.T) {
+		pool := testutil.SetupTestDB(t)
+		ctx := context.Background()
+		projRepo := pgproject.New(pool)
+		agentRepo := pgagent.New(pool)
+		taskRepo := pgtask.New(pool)
+		proj := setupProject(t, ctx, projRepo)
 
-	agent := setupAgent(t, ctx, agentRepo, proj.ID, "coder", domainagent.StatusIdle)
-	task := setupTask(t, ctx, taskRepo, proj.ID, domaintask.StatusInQA)
+		agent := setupAgent(t, ctx, agentRepo, proj.ID, "coder", domainagent.StatusIdle)
+		task1 := setupTask(t, ctx, taskRepo, proj.ID, domaintask.StatusInQA)
+		task2 := setupTask(t, ctx, taskRepo, proj.ID, domaintask.StatusInQA)
+		require.NoError(t, agentRepo.SetWorkingStatus(ctx, agent.ID, task1.ID))
 
-	ok, err := taskRepo.AssignIfIdle(ctx, task.ID, agent.ID)
-	require.NoError(t, err)
-	assert.True(t, ok, "AssignIfIdle must return true for idle agent")
+		ok, err := taskRepo.AssignIfIdle(ctx, task2.ID, agent.ID)
+		require.NoError(t, err)
+		assert.False(t, ok, "AssignIfIdle must return false for working agent")
+	})
 
-	gotAgent, err := agentRepo.GetByID(ctx, agent.ID)
-	require.NoError(t, err)
-	assert.Equal(t, domainagent.StatusWorking, gotAgent.Status)
+	t.Run("offline agent — returns false", func(t *testing.T) {
+		pool := testutil.SetupTestDB(t)
+		ctx := context.Background()
+		projRepo := pgproject.New(pool)
+		agentRepo := pgagent.New(pool)
+		taskRepo := pgtask.New(pool)
+		proj := setupProject(t, ctx, projRepo)
 
-	gotTask, err := taskRepo.GetByID(ctx, task.ID)
-	require.NoError(t, err)
-	require.NotNil(t, gotTask.AssignedAgentID)
-	assert.Equal(t, agent.ID, *gotTask.AssignedAgentID)
-}
+		agent := setupAgent(t, ctx, agentRepo, proj.ID, "coder", domainagent.StatusOffline)
+		task := setupTask(t, ctx, taskRepo, proj.ID, domaintask.StatusInQA)
 
-func TestAgentRepo_AssignIfIdle_AgentWorking(t *testing.T) {
-	pool := testutil.SetupTestDB(t)
-	ctx := context.Background()
-	projRepo := pgproject.New(pool)
-	agentRepo := pgagent.New(pool)
-	taskRepo := pgtask.New(pool)
-	proj := setupProject(t, ctx, projRepo)
-
-	agent := setupAgent(t, ctx, agentRepo, proj.ID, "coder", domainagent.StatusIdle)
-	task1 := setupTask(t, ctx, taskRepo, proj.ID, domaintask.StatusInQA)
-	task2 := setupTask(t, ctx, taskRepo, proj.ID, domaintask.StatusInQA)
-	require.NoError(t, agentRepo.SetWorkingStatus(ctx, agent.ID, task1.ID))
-
-	ok, err := taskRepo.AssignIfIdle(ctx, task2.ID, agent.ID)
-	require.NoError(t, err)
-	assert.False(t, ok, "AssignIfIdle must return false for working agent")
-}
-
-func TestAgentRepo_AssignIfIdle_AgentOffline(t *testing.T) {
-	pool := testutil.SetupTestDB(t)
-	ctx := context.Background()
-	projRepo := pgproject.New(pool)
-	agentRepo := pgagent.New(pool)
-	taskRepo := pgtask.New(pool)
-	proj := setupProject(t, ctx, projRepo)
-
-	agent := setupAgent(t, ctx, agentRepo, proj.ID, "coder", domainagent.StatusOffline)
-	task := setupTask(t, ctx, taskRepo, proj.ID, domaintask.StatusInQA)
-
-	ok, err := taskRepo.AssignIfIdle(ctx, task.ID, agent.ID)
-	require.NoError(t, err)
-	assert.False(t, ok, "AssignIfIdle must return false for offline agent")
+		ok, err := taskRepo.AssignIfIdle(ctx, task.ID, agent.ID)
+		require.NoError(t, err)
+		assert.False(t, ok, "AssignIfIdle must return false for offline agent")
+	})
 }
 
 func TestAgentRepo_ListOfflineWithInflightTasks(t *testing.T) {
-	pool := testutil.SetupTestDB(t)
-	ctx := context.Background()
-	projRepo := pgproject.New(pool)
-	agentRepo := pgagent.New(pool)
-	taskRepo := pgtask.New(pool)
-	proj := setupProject(t, ctx, projRepo)
+	t.Run("offline agent with in-progress task is included", func(t *testing.T) {
+		pool := testutil.SetupTestDB(t)
+		ctx := context.Background()
+		projRepo := pgproject.New(pool)
+		agentRepo := pgagent.New(pool)
+		taskRepo := pgtask.New(pool)
+		proj := setupProject(t, ctx, projRepo)
 
-	offlineAgent := setupAgent(t, ctx, agentRepo, proj.ID, "coder", domainagent.StatusOffline)
-	idleAgent := setupAgent(t, ctx, agentRepo, proj.ID, "coder", domainagent.StatusIdle)
-	inProgressTask := setupTask(t, ctx, taskRepo, proj.ID, domaintask.StatusInProgress)
-	readyTask := setupTask(t, ctx, taskRepo, proj.ID, domaintask.StatusReady)
+		offlineAgent := setupAgent(t, ctx, agentRepo, proj.ID, "coder", domainagent.StatusOffline)
+		idleAgent := setupAgent(t, ctx, agentRepo, proj.ID, "coder", domainagent.StatusIdle)
+		inProgressTask := setupTask(t, ctx, taskRepo, proj.ID, domaintask.StatusInProgress)
+		readyTask := setupTask(t, ctx, taskRepo, proj.ID, domaintask.StatusReady)
 
-	require.NoError(t, taskRepo.Assign(ctx, inProgressTask.ID, offlineAgent.ID))
-	require.NoError(t, taskRepo.Assign(ctx, readyTask.ID, idleAgent.ID))
+		require.NoError(t, taskRepo.Assign(ctx, inProgressTask.ID, offlineAgent.ID))
+		require.NoError(t, taskRepo.Assign(ctx, readyTask.ID, idleAgent.ID))
 
-	ids, err := agentRepo.ListOfflineWithInflightTasks(ctx)
-	require.NoError(t, err)
-	assert.Contains(t, ids, offlineAgent.ID)
-	assert.NotContains(t, ids, idleAgent.ID)
-}
+		ids, err := agentRepo.ListOfflineWithInflightTasks(ctx)
+		require.NoError(t, err)
+		assert.Contains(t, ids, offlineAgent.ID)
+		assert.NotContains(t, ids, idleAgent.ID)
+	})
 
-func TestAgentRepo_ListOfflineWithInflightTasks_Empty(t *testing.T) {
-	pool := testutil.SetupTestDB(t)
-	ctx := context.Background()
-	projRepo := pgproject.New(pool)
-	proj := setupProject(t, ctx, projRepo)
-	agentRepo := pgagent.New(pool)
+	t.Run("no offline agents with inflight tasks returns empty slice", func(t *testing.T) {
+		pool := testutil.SetupTestDB(t)
+		ctx := context.Background()
+		projRepo := pgproject.New(pool)
+		proj := setupProject(t, ctx, projRepo)
+		agentRepo := pgagent.New(pool)
 
-	_ = setupAgent(t, ctx, agentRepo, proj.ID, "coder", domainagent.StatusIdle)
+		_ = setupAgent(t, ctx, agentRepo, proj.ID, "coder", domainagent.StatusIdle)
 
-	ids, err := agentRepo.ListOfflineWithInflightTasks(ctx)
-	require.NoError(t, err)
-	// Must return an empty slice (not nil) — callers rely on len check.
-	if ids == nil {
-		ids = []uuid.UUID{}
-	}
-	assert.Empty(t, ids)
-}
-
-// FIFO: oldest idle agent is claimed first.
-func TestAgentRepo_ClaimAgent_FIFO(t *testing.T) {
-	pool := testutil.SetupTestDB(t)
-	ctx := context.Background()
-	projRepo := pgproject.New(pool)
-	agentRepo := pgagent.New(pool)
-	proj := setupProject(t, ctx, projRepo)
-
-	first := setupAgent(t, ctx, agentRepo, proj.ID, "coder", domainagent.StatusIdle)
-	time.Sleep(2 * time.Millisecond) // ensure different created_at
-	_ = setupAgent(t, ctx, agentRepo, proj.ID, "coder", domainagent.StatusIdle)
-
-	claimedID, err := agentRepo.ClaimAgent(ctx, proj.ID, "coder")
-	require.NoError(t, err)
-	assert.Equal(t, first.ID, claimedID, "oldest idle agent should be claimed first (FIFO)")
+		ids, err := agentRepo.ListOfflineWithInflightTasks(ctx)
+		require.NoError(t, err)
+		if ids == nil {
+			ids = []uuid.UUID{}
+		}
+		assert.Empty(t, ids)
+	})
 }

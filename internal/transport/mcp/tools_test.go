@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 
+	domainagent "github.com/alanyang/agent-mesh/internal/domain/agent"
 	"github.com/alanyang/agent-mesh/internal/domain/pipeline"
 	domaintask "github.com/alanyang/agent-mesh/internal/domain/task"
 	domainthread "github.com/alanyang/agent-mesh/internal/domain/thread"
@@ -20,7 +21,6 @@ import (
 	agentsvc "github.com/alanyang/agent-mesh/internal/service/agent"
 	tasksvc "github.com/alanyang/agent-mesh/internal/service/task"
 	threadsvc "github.com/alanyang/agent-mesh/internal/service/thread"
-	domainagent "github.com/alanyang/agent-mesh/internal/domain/agent"
 )
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -66,6 +66,16 @@ func allowSweep(d toolsDeps) {
 		Return(uuid.Nil, errors.New("no agent")).AnyTimes()
 }
 
+// sweepOnce registers a single sweep call that decrements wg when the goroutine runs.
+func sweepOnce(d toolsDeps, wg *sync.WaitGroup) {
+	d.locker.EXPECT().WithLock(gomock.Any(), gomock.Any(), gomock.Any()).
+		DoAndReturn(func(ctx context.Context, _ int64, fn func(context.Context) error) error {
+			defer wg.Done()
+			return fn(ctx)
+		})
+	d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).Return([]domaintask.Task{}, nil).AnyTimes()
+}
+
 func makeReq(args map[string]any) mcpmcp.CallToolRequest {
 	var req mcpmcp.CallToolRequest
 	req.Params.Arguments = args
@@ -97,608 +107,584 @@ func validRolesForTest() map[string]bool {
 
 // ── registerAgentHandler ──────────────────────────────────────────────────────
 
-func TestRegisterAgent_NewAgent(t *testing.T) {
-	aSvc, tSvc, _, d := newToolsDeps(t)
-	reg := NewSessionRegistry()
-	handler := registerAgentHandler(nil, reg, aSvc, tSvc, validRolesForTest())
+func TestRegisterAgentHandler(t *testing.T) {
+	tests := []struct {
+		name         string
+		args         map[string]any
+		setup        func(d toolsDeps, wg *sync.WaitGroup)
+		wantContains string
+		wantErr      bool
+	}{
+		{
+			name: "new agent registered and ID returned",
+			args: map[string]any{
+				"project_id": uuid.New().String(),
+				"role":       "coder",
+				"name":       "bot",
+				"model":      "gpt4",
+			},
+			setup: func(d toolsDeps, wg *sync.WaitGroup) {
+				agentID := uuid.New()
+				projectID := uuid.New()
+				expected := domainagent.Agent{ID: agentID, ProjectID: projectID, Role: "coder", Status: domainagent.StatusIdle}
+				d.agentRepo.EXPECT().Create(gomock.Any(), gomock.Any()).Return(expected, nil)
+				d.bus.EXPECT().Publish(gomock.Any(), gomock.Any()).Return(nil)
+				wg.Add(1)
+				sweepOnce(d, wg)
+			},
+		},
+		{
+			name: "invalid project_id returns error text",
+			args: map[string]any{"project_id": "not-a-uuid", "role": "coder", "name": "bot", "model": "gpt4"},
+			setup: func(d toolsDeps, wg *sync.WaitGroup) {},
+			wantContains: "error: invalid project_id",
+		},
+		{
+			name: "invalid role returns error text",
+			args: map[string]any{"project_id": uuid.New().String(), "role": "admin", "name": "bot", "model": "gpt4"},
+			setup: func(d toolsDeps, wg *sync.WaitGroup) {},
+			wantContains: "error: invalid role",
+		},
+		{
+			name: "reconnect with existing agent_id reactivates",
+			args: map[string]any{
+				"project_id": uuid.New().String(),
+				"role":       "coder",
+				"name":       "bot",
+				"model":      "gpt4",
+				"agent_id":   uuid.New().String(),
+			},
+			setup: func(d toolsDeps, wg *sync.WaitGroup) {
+				existingID := uuid.New()
+				projectID := uuid.New()
+				stored := domainagent.Agent{ID: existingID, ProjectID: projectID, Role: "coder", Status: domainagent.StatusIdle}
+				d.agentRepo.EXPECT().GetByID(gomock.Any(), gomock.Any()).Return(stored, nil)
+				d.agentRepo.EXPECT().UpdateStatus(gomock.Any(), gomock.Any(), domainagent.StatusIdle).Return(nil)
+				d.bus.EXPECT().Publish(gomock.Any(), gomock.Any()).Return(nil)
+				wg.Add(1)
+				sweepOnce(d, wg)
+			},
+		},
+		{
+			name: "agent_id not found falls through to create new agent",
+			args: map[string]any{
+				"project_id": uuid.New().String(),
+				"role":       "coder",
+				"name":       "bot",
+				"model":      "gpt4",
+				"agent_id":   uuid.New().String(),
+			},
+			setup: func(d toolsDeps, wg *sync.WaitGroup) {
+				newAgentID := uuid.New()
+				projectID := uuid.New()
+				newAgent := domainagent.Agent{ID: newAgentID, ProjectID: projectID, Role: "coder", Status: domainagent.StatusIdle}
+				d.agentRepo.EXPECT().GetByID(gomock.Any(), gomock.Any()).Return(domainagent.Agent{}, errors.New("not found"))
+				d.agentRepo.EXPECT().Create(gomock.Any(), gomock.Any()).Return(newAgent, nil)
+				d.bus.EXPECT().Publish(gomock.Any(), gomock.Any()).Return(nil)
+				allowSweep(d)
+			},
+		},
+		{
+			// Handler always passes []string{} for skills — skills are a V2 concern.
+			name: "skills field ignored — always passes empty skills",
+			args: map[string]any{
+				"project_id": uuid.New().String(),
+				"role":       "coder",
+				"name":       "bot",
+				"model":      "gpt4",
+			},
+			setup: func(d toolsDeps, wg *sync.WaitGroup) {
+				d.agentRepo.EXPECT().Create(gomock.Any(), gomock.Any()).
+					DoAndReturn(func(_ context.Context, a domainagent.Agent) (domainagent.Agent, error) {
+						assert.Empty(t, a.Skills, "handler must pass empty skills")
+						return domainagent.Agent{ID: uuid.New(), Role: "coder"}, nil
+					})
+				d.bus.EXPECT().Publish(gomock.Any(), gomock.Any()).Return(nil)
+				allowSweep(d)
+			},
+		},
+	}
 
-	projectID := uuid.New()
-	agentID := uuid.New()
-	expected := domainagent.Agent{ID: agentID, ProjectID: projectID, Role: "coder", Status: domainagent.StatusIdle}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			aSvc, tSvc, _, d := newToolsDeps(t)
+			reg := NewSessionRegistry()
+			handler := registerAgentHandler(nil, reg, aSvc, tSvc, validRolesForTest())
 
-	d.agentRepo.EXPECT().Create(gomock.Any(), gomock.Any()).Return(expected, nil)
-	d.bus.EXPECT().Publish(gomock.Any(), gomock.Any()).Return(nil)
-	// Sweep goroutine.
-	var wg sync.WaitGroup
-	wg.Add(1)
-	d.locker.EXPECT().WithLock(gomock.Any(), gomock.Any(), gomock.Any()).
-		DoAndReturn(func(ctx context.Context, _ int64, fn func(context.Context) error) error {
-			defer wg.Done()
-			return fn(ctx)
+			// Override args with correct project_id/agent_id UUIDs where needed.
+			args := tt.args
+
+			var wg sync.WaitGroup
+			tt.setup(d, &wg)
+
+			result, err := handler(context.Background(), makeReq(args))
+			wg.Wait()
+
+			require.NoError(t, err)
+			if tt.wantContains != "" {
+				assert.Contains(t, resultText(result), tt.wantContains)
+			}
 		})
-	d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).Return([]domaintask.Task{}, nil).AnyTimes()
-
-	result, err := handler(context.Background(), makeReq(map[string]any{
-		"project_id": projectID.String(),
-		"role":       "coder",
-		"name":       "bot",
-		"model":      "gpt4",
-	}))
-	wg.Wait()
-	require.NoError(t, err)
-	text := resultText(result)
-	assert.Contains(t, text, agentID.String())
-}
-
-func TestRegisterAgent_InvalidProjectID(t *testing.T) {
-	aSvc, tSvc, _, _ := newToolsDeps(t)
-	handler := registerAgentHandler(nil, NewSessionRegistry(), aSvc, tSvc, validRolesForTest())
-
-	result, err := handler(context.Background(), makeReq(map[string]any{
-		"project_id": "not-a-uuid",
-		"role":       "coder",
-		"name":       "bot",
-		"model":      "gpt4",
-	}))
-	require.NoError(t, err)
-	assert.Contains(t, resultText(result), "error: invalid project_id")
-}
-
-func TestRegisterAgent_InvalidRole(t *testing.T) {
-	aSvc, tSvc, _, _ := newToolsDeps(t)
-	handler := registerAgentHandler(nil, NewSessionRegistry(), aSvc, tSvc, validRolesForTest())
-
-	result, err := handler(context.Background(), makeReq(map[string]any{
-		"project_id": uuid.New().String(),
-		"role":       "admin", // invalid role
-		"name":       "bot",
-		"model":      "gpt4",
-	}))
-	require.NoError(t, err)
-	assert.Contains(t, resultText(result), "error: invalid role")
-}
-
-func TestRegisterAgent_Reconnect_Success(t *testing.T) {
-	aSvc, tSvc, _, d := newToolsDeps(t)
-	handler := registerAgentHandler(nil, NewSessionRegistry(), aSvc, tSvc, validRolesForTest())
-
-	existingID := uuid.New()
-	projectID := uuid.New()
-	stored := domainagent.Agent{ID: existingID, ProjectID: projectID, Role: "coder", Status: domainagent.StatusIdle}
-
-	d.agentRepo.EXPECT().GetByID(gomock.Any(), existingID).Return(stored, nil)
-	d.agentRepo.EXPECT().UpdateStatus(gomock.Any(), existingID, domainagent.StatusIdle).Return(nil)
-	d.bus.EXPECT().Publish(gomock.Any(), gomock.Any()).Return(nil)
-	// Sweep goroutine.
-	var wg sync.WaitGroup
-	wg.Add(1)
-	d.locker.EXPECT().WithLock(gomock.Any(), gomock.Any(), gomock.Any()).
-		DoAndReturn(func(ctx context.Context, _ int64, fn func(context.Context) error) error {
-			defer wg.Done()
-			return fn(ctx)
-		})
-	d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).Return([]domaintask.Task{}, nil).AnyTimes()
-
-	result, err := handler(context.Background(), makeReq(map[string]any{
-		"project_id": projectID.String(),
-		"role":       "coder",
-		"name":       "bot",
-		"model":      "gpt4",
-		"agent_id":   existingID.String(),
-	}))
-	wg.Wait()
-	require.NoError(t, err)
-	assert.Contains(t, resultText(result), existingID.String())
-}
-
-func TestRegisterAgent_Reconnect_NotFound_FallsThrough(t *testing.T) {
-	// agent_id provided but not found → falls through to create new agent.
-	aSvc, tSvc, _, d := newToolsDeps(t)
-	handler := registerAgentHandler(nil, NewSessionRegistry(), aSvc, tSvc, validRolesForTest())
-
-	existingID := uuid.New()
-	newAgentID := uuid.New()
-	projectID := uuid.New()
-	newAgent := domainagent.Agent{ID: newAgentID, ProjectID: projectID, Role: "coder", Status: domainagent.StatusIdle}
-
-	d.agentRepo.EXPECT().GetByID(gomock.Any(), existingID).Return(domainagent.Agent{}, errors.New("not found"))
-	d.agentRepo.EXPECT().Create(gomock.Any(), gomock.Any()).Return(newAgent, nil)
-	d.bus.EXPECT().Publish(gomock.Any(), gomock.Any()).Return(nil)
-	allowSweep(d)
-
-	result, err := handler(context.Background(), makeReq(map[string]any{
-		"project_id": projectID.String(),
-		"role":       "coder",
-		"name":       "bot",
-		"model":      "gpt4",
-		"agent_id":   existingID.String(),
-	}))
-	require.NoError(t, err)
-	assert.Contains(t, resultText(result), newAgentID.String())
-}
-
-func TestRegisterAgent_SkillsNotSupported(t *testing.T) {
-	// Handler always passes []string{} for skills regardless of input.
-	aSvc, tSvc, _, d := newToolsDeps(t)
-	handler := registerAgentHandler(nil, NewSessionRegistry(), aSvc, tSvc, validRolesForTest())
-	projectID := uuid.New()
-	agentID := uuid.New()
-
-	d.agentRepo.EXPECT().Create(gomock.Any(), gomock.Any()).
-		DoAndReturn(func(_ context.Context, a domainagent.Agent) (domainagent.Agent, error) {
-			assert.Empty(t, a.Skills, "handler must pass empty skills — skills are a V2 concern")
-			return domainagent.Agent{ID: agentID, ProjectID: projectID, Role: "coder"}, nil
-		})
-	d.bus.EXPECT().Publish(gomock.Any(), gomock.Any()).Return(nil)
-	allowSweep(d)
-
-	_, err := handler(context.Background(), makeReq(map[string]any{
-		"project_id": projectID.String(),
-		"role":       "coder",
-		"name":       "bot",
-		"model":      "gpt4",
-	}))
-	require.NoError(t, err)
+	}
 }
 
 // ── claimTaskHandler ──────────────────────────────────────────────────────────
 
-func TestClaimTask_TaskAssigned_SetsWorking(t *testing.T) {
-	aSvc, tSvc, _, d := newToolsDeps(t)
-	handler := claimTaskHandler(tSvc, aSvc)
-
-	agentID := uuid.New()
-	projectID := uuid.New()
-	taskID := uuid.New()
-	agent := domainagent.Agent{ID: agentID, ProjectID: projectID, Role: "coder"}
-	task := domaintask.Task{ID: taskID, ProjectID: projectID, Status: domaintask.StatusInProgress, Labels: []string{}}
-
-	d.agentRepo.EXPECT().GetByID(gomock.Any(), agentID).Return(agent, nil)
-	d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).Return([]domaintask.Task{task}, nil)
-	d.agentRepo.EXPECT().SetWorkingStatus(gomock.Any(), agentID, taskID).Return(nil)
-
-	result, err := handler(context.Background(), makeReq(map[string]any{"agent_id": agentID.String()}))
-	require.NoError(t, err)
-	text := resultText(result)
-	assert.Contains(t, text, taskID.String())
-}
-
-func TestClaimTask_NoTask_SetsIdle(t *testing.T) {
-	aSvc, tSvc, _, d := newToolsDeps(t)
-	handler := claimTaskHandler(tSvc, aSvc)
-
-	agentID := uuid.New()
-	projectID := uuid.New()
-	agent := domainagent.Agent{ID: agentID, ProjectID: projectID, Role: "coder"}
-
-	d.agentRepo.EXPECT().GetByID(gomock.Any(), agentID).Return(agent, nil)
-	d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).Return([]domaintask.Task{}, nil)
-	d.agentRepo.EXPECT().SetIdleStatus(gomock.Any(), agentID).Return(nil)
-	// Sweep goroutine.
-	var wg sync.WaitGroup
-	wg.Add(1)
-	d.locker.EXPECT().WithLock(gomock.Any(), gomock.Any(), gomock.Any()).
-		DoAndReturn(func(ctx context.Context, _ int64, fn func(context.Context) error) error {
-			defer wg.Done()
-			return fn(ctx)
-		})
-	d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).Return([]domaintask.Task{}, nil).AnyTimes()
-
-	result, err := handler(context.Background(), makeReq(map[string]any{"agent_id": agentID.String()}))
-	wg.Wait()
-	require.NoError(t, err)
-	assert.Equal(t, "null", resultText(result))
-}
-
-func TestClaimTask_SkipsTerminalTasks(t *testing.T) {
-	// merged and backlog are both skipped.
-	aSvc, tSvc, _, d := newToolsDeps(t)
-	handler := claimTaskHandler(tSvc, aSvc)
-
-	agentID := uuid.New()
-	projectID := uuid.New()
-	agent := domainagent.Agent{ID: agentID, ProjectID: projectID, Role: "coder"}
-	tasks := []domaintask.Task{
-		{ID: uuid.New(), Status: domaintask.StatusMerged, Labels: []string{}},
-		{ID: uuid.New(), Status: domaintask.StatusBacklog, Labels: []string{}},
+func TestClaimTaskHandler(t *testing.T) {
+	tests := []struct {
+		name         string
+		agentIDStr   string
+		setup        func(d toolsDeps, agentID uuid.UUID, wg *sync.WaitGroup)
+		wantContains string
+	}{
+		{
+			name: "task assigned — sets working and returns task",
+			setup: func(d toolsDeps, agentID uuid.UUID, wg *sync.WaitGroup) {
+				projectID := uuid.New()
+				taskID := uuid.New()
+				agent := domainagent.Agent{ID: agentID, ProjectID: projectID, Role: "coder"}
+				task := domaintask.Task{ID: taskID, ProjectID: projectID, Status: domaintask.StatusInProgress, Labels: []string{}}
+				d.agentRepo.EXPECT().GetByID(gomock.Any(), agentID).Return(agent, nil)
+				d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).Return([]domaintask.Task{task}, nil)
+				d.agentRepo.EXPECT().SetWorkingStatus(gomock.Any(), agentID, taskID).Return(nil)
+			},
+		},
+		{
+			name: "no task — sets idle and returns null",
+			setup: func(d toolsDeps, agentID uuid.UUID, wg *sync.WaitGroup) {
+				projectID := uuid.New()
+				agent := domainagent.Agent{ID: agentID, ProjectID: projectID, Role: "coder"}
+				d.agentRepo.EXPECT().GetByID(gomock.Any(), agentID).Return(agent, nil)
+				d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).Return([]domaintask.Task{}, nil)
+				d.agentRepo.EXPECT().SetIdleStatus(gomock.Any(), agentID).Return(nil)
+				wg.Add(1)
+				sweepOnce(d, wg)
+				d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).Return([]domaintask.Task{}, nil).AnyTimes()
+			},
+			wantContains: "null",
+		},
+		{
+			name: "merged and backlog tasks skipped — sets idle",
+			setup: func(d toolsDeps, agentID uuid.UUID, wg *sync.WaitGroup) {
+				projectID := uuid.New()
+				agent := domainagent.Agent{ID: agentID, ProjectID: projectID, Role: "coder"}
+				tasks := []domaintask.Task{
+					{ID: uuid.New(), Status: domaintask.StatusMerged, Labels: []string{}},
+					{ID: uuid.New(), Status: domaintask.StatusBacklog, Labels: []string{}},
+				}
+				d.agentRepo.EXPECT().GetByID(gomock.Any(), agentID).Return(agent, nil)
+				d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).Return(tasks, nil)
+				d.agentRepo.EXPECT().SetIdleStatus(gomock.Any(), agentID).Return(nil)
+				allowSweep(d)
+			},
+			wantContains: "null",
+		},
+		{
+			name:       "invalid agent_id returns error text",
+			agentIDStr: "not-a-uuid",
+			setup:      func(d toolsDeps, agentID uuid.UUID, wg *sync.WaitGroup) {},
+			wantContains: "error: invalid agent_id",
+		},
+		{
+			name: "agent not found returns error text",
+			setup: func(d toolsDeps, agentID uuid.UUID, wg *sync.WaitGroup) {
+				d.agentRepo.EXPECT().GetByID(gomock.Any(), agentID).Return(domainagent.Agent{}, errors.New("agent not found"))
+			},
+			wantContains: "error: agent not found",
+		},
 	}
 
-	d.agentRepo.EXPECT().GetByID(gomock.Any(), agentID).Return(agent, nil)
-	d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).Return(tasks, nil)
-	d.agentRepo.EXPECT().SetIdleStatus(gomock.Any(), agentID).Return(nil)
-	allowSweep(d)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			aSvc, tSvc, _, d := newToolsDeps(t)
+			handler := claimTaskHandler(tSvc, aSvc)
 
-	result, err := handler(context.Background(), makeReq(map[string]any{"agent_id": agentID.String()}))
-	require.NoError(t, err)
-	assert.Equal(t, "null", resultText(result))
-}
+			agentID := uuid.New()
+			agentIDStr := tt.agentIDStr
+			if agentIDStr == "" {
+				agentIDStr = agentID.String()
+			}
 
-func TestClaimTask_InvalidAgentID(t *testing.T) {
-	aSvc, tSvc, _, _ := newToolsDeps(t)
-	handler := claimTaskHandler(tSvc, aSvc)
+			var wg sync.WaitGroup
+			tt.setup(d, agentID, &wg)
 
-	result, err := handler(context.Background(), makeReq(map[string]any{"agent_id": "not-a-uuid"}))
-	require.NoError(t, err)
-	assert.Contains(t, resultText(result), "error: invalid agent_id")
-}
+			result, err := handler(context.Background(), makeReq(map[string]any{"agent_id": agentIDStr}))
+			wg.Wait()
 
-func TestClaimTask_AgentNotFound(t *testing.T) {
-	aSvc, tSvc, _, d := newToolsDeps(t)
-	handler := claimTaskHandler(tSvc, aSvc)
-
-	agentID := uuid.New()
-	d.agentRepo.EXPECT().GetByID(gomock.Any(), agentID).Return(domainagent.Agent{}, errors.New("agent not found"))
-
-	result, err := handler(context.Background(), makeReq(map[string]any{"agent_id": agentID.String()}))
-	require.NoError(t, err)
-	assert.Contains(t, resultText(result), "error: agent not found")
+			require.NoError(t, err)
+			if tt.wantContains != "" {
+				assert.Contains(t, resultText(result), tt.wantContains)
+			}
+		})
+	}
 }
 
 // ── updateTaskStatusHandler ───────────────────────────────────────────────────
 
-func TestUpdateTaskStatus_ValidTransition(t *testing.T) {
-	_, tSvc, _, d := newToolsDeps(t)
-	handler := updateTaskStatusHandler(tSvc)
+func TestUpdateTaskStatusHandler(t *testing.T) {
+	tests := []struct {
+		name         string
+		args         map[string]any
+		setup        func(d toolsDeps, taskID uuid.UUID)
+		wantContains string
+	}{
+		{
+			name: "valid transition returns ok:true",
+			setup: func(d toolsDeps, taskID uuid.UUID) {
+				projectID := uuid.New()
+				task := domaintask.Task{ID: taskID, ProjectID: projectID, Status: domaintask.StatusInReview, Labels: []string{}}
+				d.taskRepo.EXPECT().UpdateStatus(gomock.Any(), taskID, domaintask.StatusInQA, domaintask.StatusInReview).Return(nil)
+				d.bus.EXPECT().Publish(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+				d.taskRepo.EXPECT().GetByID(gomock.Any(), taskID).Return(task, nil).AnyTimes()
+				allowSweep(d)
+			},
+			wantContains: `"ok":true`,
+		},
+		{
+			name:         "invalid transition returns error text",
+			setup:        func(d toolsDeps, taskID uuid.UUID) {},
+			wantContains: "invalid transition",
+			args:         map[string]any{"from": "merged", "to": "ready"},
+		},
+		{
+			name:         "garbage from status returns error",
+			setup:        func(d toolsDeps, taskID uuid.UUID) {},
+			wantContains: "error:",
+			args:         map[string]any{"from": "garbage", "to": "ready"},
+		},
+		{
+			name:         "invalid task_id returns error",
+			setup:        func(d toolsDeps, taskID uuid.UUID) {},
+			wantContains: "error: invalid task_id",
+			args:         map[string]any{"task_id": "not-a-uuid", "from": "backlog", "to": "ready"},
+		},
+	}
 
-	taskID := uuid.New()
-	projectID := uuid.New()
-	// Use in_qa→in_review: reviewer gets distributed (or not), sweep for "qa" fires.
-	task := domaintask.Task{ID: taskID, ProjectID: projectID, Status: domaintask.StatusInReview, Labels: []string{}}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, tSvc, _, d := newToolsDeps(t)
+			handler := updateTaskStatusHandler(tSvc)
 
-	d.taskRepo.EXPECT().UpdateStatus(gomock.Any(), taskID, domaintask.StatusInQA, domaintask.StatusInReview).Return(nil)
-	d.bus.EXPECT().Publish(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
-	d.taskRepo.EXPECT().GetByID(gomock.Any(), taskID).Return(task, nil).AnyTimes()
-	allowSweep(d)
+			taskID := uuid.New()
+			tt.setup(d, taskID)
 
-	result, err := handler(context.Background(), makeReq(map[string]any{
-		"task_id": taskID.String(),
-		"from":    "in_qa",
-		"to":      "in_review",
-	}))
-	require.NoError(t, err)
-	assert.Contains(t, resultText(result), `"ok":true`)
-}
+			args := tt.args
+			if args == nil {
+				args = map[string]any{"task_id": taskID.String(), "from": "in_qa", "to": "in_review"}
+			} else if _, hasTaskID := args["task_id"]; !hasTaskID {
+				args["task_id"] = taskID.String()
+			}
 
-func TestUpdateTaskStatus_InvalidTransition(t *testing.T) {
-	_, tSvc, _, _ := newToolsDeps(t)
-	handler := updateTaskStatusHandler(tSvc)
-
-	result, err := handler(context.Background(), makeReq(map[string]any{
-		"task_id": uuid.New().String(),
-		"from":    "merged",
-		"to":      "ready",
-	}))
-	require.NoError(t, err)
-	assert.Contains(t, resultText(result), "error:")
-	assert.Contains(t, resultText(result), "invalid transition")
-}
-
-func TestUpdateTaskStatus_GarbageFromStatus(t *testing.T) {
-	_, tSvc, _, _ := newToolsDeps(t)
-	handler := updateTaskStatusHandler(tSvc)
-
-	result, err := handler(context.Background(), makeReq(map[string]any{
-		"task_id": uuid.New().String(),
-		"from":    "garbage",
-		"to":      "ready",
-	}))
-	require.NoError(t, err)
-	assert.Contains(t, resultText(result), "error:")
-}
-
-func TestUpdateTaskStatus_InvalidTaskID(t *testing.T) {
-	_, tSvc, _, _ := newToolsDeps(t)
-	handler := updateTaskStatusHandler(tSvc)
-
-	result, err := handler(context.Background(), makeReq(map[string]any{
-		"task_id": "not-a-uuid",
-		"from":    "backlog",
-		"to":      "ready",
-	}))
-	require.NoError(t, err)
-	assert.Contains(t, resultText(result), "error: invalid task_id")
+			result, err := handler(context.Background(), makeReq(args))
+			require.NoError(t, err)
+			assert.Contains(t, resultText(result), tt.wantContains)
+		})
+	}
 }
 
 // ── postMessageHandler ────────────────────────────────────────────────────────
 
-func TestPostMessage_Success(t *testing.T) {
-	_, _, thSvc, d := newToolsDeps(t)
-	handler := postMessageHandler(thSvc)
+func TestPostMessageHandler(t *testing.T) {
+	// sharedAgentID is pre-declared so both the setup closure and the args map
+	// can reference the same UUID for the "with agent_id" case.
+	sharedAgentID := uuid.New()
 
-	taskID := uuid.New()
-	threadID := uuid.New()
-	msgID := uuid.New()
-	thread := domainthread.Thread{ID: threadID}
-	msg := domainthread.Message{ID: msgID, ThreadID: threadID, Content: "progress!"}
+	tests := []struct {
+		name         string
+		args         map[string]any
+		setup        func(d toolsDeps)
+		wantContains string
+	}{
+		{
+			name: "success returns message ID",
+			setup: func(d toolsDeps) {
+				threadID := uuid.New()
+				msgID := uuid.New()
+				thread := domainthread.Thread{ID: threadID}
+				msg := domainthread.Message{ID: msgID, ThreadID: threadID, Content: "progress!"}
+				d.threadRepo.EXPECT().ListThreads(gomock.Any(), gomock.Any()).Return([]domainthread.Thread{thread}, nil)
+				d.threadRepo.EXPECT().CreateMessage(gomock.Any(), gomock.Any()).Return(msg, nil)
+				d.bus.EXPECT().Publish(gomock.Any(), gomock.Any()).Return(nil)
+			},
+		},
+		{
+			name: "no thread returns error text",
+			setup: func(d toolsDeps) {
+				d.threadRepo.EXPECT().ListThreads(gomock.Any(), gomock.Any()).Return([]domainthread.Thread{}, nil)
+			},
+			wantContains: "thread not found",
+		},
+		{
+			name: "with agent_id sets AgentID on message",
+			setup: func(d toolsDeps) {
+				threadID := uuid.New()
+				thread := domainthread.Thread{ID: threadID}
+				msg := domainthread.Message{ID: uuid.New(), AgentID: &sharedAgentID}
+				d.threadRepo.EXPECT().ListThreads(gomock.Any(), gomock.Any()).Return([]domainthread.Thread{thread}, nil)
+				d.threadRepo.EXPECT().CreateMessage(gomock.Any(), gomock.Any()).
+					DoAndReturn(func(_ context.Context, m domainthread.Message) (domainthread.Message, error) {
+						require.NotNil(t, m.AgentID)
+						assert.Equal(t, sharedAgentID, *m.AgentID)
+						return msg, nil
+					})
+				d.bus.EXPECT().Publish(gomock.Any(), gomock.Any()).Return(nil)
+			},
+			args: map[string]any{
+				"task_id":   uuid.New().String(),
+				"content":   "hello",
+				"post_type": "progress",
+				"agent_id":  sharedAgentID.String(),
+			},
+		},
+		{
+			name:         "invalid post_type returns error",
+			setup:        func(d toolsDeps) {},
+			wantContains: "error: invalid post_type",
+			args:         map[string]any{"task_id": uuid.New().String(), "content": "hi", "post_type": "approve"},
+		},
+		{
+			name:         "whitespace-only content returns error",
+			setup:        func(d toolsDeps) {},
+			wantContains: "error: content must not be empty",
+			args:         map[string]any{"task_id": uuid.New().String(), "content": "   ", "post_type": "progress"},
+		},
+		{
+			name:         "invalid task_id returns error",
+			setup:        func(d toolsDeps) {},
+			wantContains: "error: invalid task_id",
+			args:         map[string]any{"task_id": "not-a-uuid", "content": "hi", "post_type": "progress"},
+		},
+	}
 
-	d.threadRepo.EXPECT().ListThreads(gomock.Any(), gomock.Any()).Return([]domainthread.Thread{thread}, nil)
-	d.threadRepo.EXPECT().CreateMessage(gomock.Any(), gomock.Any()).Return(msg, nil)
-	d.bus.EXPECT().Publish(gomock.Any(), gomock.Any()).Return(nil)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, thSvc, d := newToolsDeps(t)
+			handler := postMessageHandler(thSvc)
 
-	result, err := handler(context.Background(), makeReq(map[string]any{
-		"task_id":   taskID.String(),
-		"content":   "progress!",
-		"post_type": "progress",
-	}))
-	require.NoError(t, err)
-	assert.Contains(t, resultText(result), msgID.String())
-}
+			tt.setup(d)
 
-func TestPostMessage_NoThread(t *testing.T) {
-	_, _, thSvc, d := newToolsDeps(t)
-	handler := postMessageHandler(thSvc)
+			args := tt.args
+			if args == nil {
+				args = map[string]any{
+					"task_id":   uuid.New().String(),
+					"content":   "progress!",
+					"post_type": "progress",
+				}
+			}
 
-	d.threadRepo.EXPECT().ListThreads(gomock.Any(), gomock.Any()).Return([]domainthread.Thread{}, nil)
-
-	result, err := handler(context.Background(), makeReq(map[string]any{
-		"task_id":   uuid.New().String(),
-		"content":   "hello",
-		"post_type": "progress",
-	}))
-	require.NoError(t, err)
-	assert.Contains(t, resultText(result), "error:")
-	assert.Contains(t, resultText(result), "thread not found")
-}
-
-func TestPostMessage_WithAgentID(t *testing.T) {
-	_, _, thSvc, d := newToolsDeps(t)
-	handler := postMessageHandler(thSvc)
-
-	taskID := uuid.New()
-	agentID := uuid.New()
-	threadID := uuid.New()
-	thread := domainthread.Thread{ID: threadID}
-	msg := domainthread.Message{ID: uuid.New(), AgentID: &agentID}
-
-	d.threadRepo.EXPECT().ListThreads(gomock.Any(), gomock.Any()).Return([]domainthread.Thread{thread}, nil)
-	d.threadRepo.EXPECT().CreateMessage(gomock.Any(), gomock.Any()).
-		DoAndReturn(func(_ context.Context, m domainthread.Message) (domainthread.Message, error) {
-			require.NotNil(t, m.AgentID)
-			assert.Equal(t, agentID, *m.AgentID)
-			return msg, nil
+			result, err := handler(context.Background(), makeReq(args))
+			require.NoError(t, err)
+			if tt.wantContains != "" {
+				assert.Contains(t, resultText(result), tt.wantContains)
+			}
 		})
-	d.bus.EXPECT().Publish(gomock.Any(), gomock.Any()).Return(nil)
-
-	_, err := handler(context.Background(), makeReq(map[string]any{
-		"task_id":   taskID.String(),
-		"content":   "hello",
-		"post_type": "progress",
-		"agent_id":  agentID.String(),
-	}))
-	require.NoError(t, err)
-}
-
-func TestPostMessage_InvalidPostType(t *testing.T) {
-	_, _, thSvc, _ := newToolsDeps(t)
-	handler := postMessageHandler(thSvc)
-
-	result, err := handler(context.Background(), makeReq(map[string]any{
-		"task_id":   uuid.New().String(),
-		"content":   "hi",
-		"post_type": "approve", // invalid
-	}))
-	require.NoError(t, err)
-	assert.Contains(t, resultText(result), "error: invalid post_type")
-}
-
-func TestPostMessage_EmptyContent(t *testing.T) {
-	_, _, thSvc, _ := newToolsDeps(t)
-	handler := postMessageHandler(thSvc)
-
-	result, err := handler(context.Background(), makeReq(map[string]any{
-		"task_id":   uuid.New().String(),
-		"content":   "   ", // whitespace only
-		"post_type": "progress",
-	}))
-	require.NoError(t, err)
-	assert.Contains(t, resultText(result), "error: content must not be empty")
-}
-
-func TestPostMessage_InvalidTaskID(t *testing.T) {
-	_, _, thSvc, _ := newToolsDeps(t)
-	handler := postMessageHandler(thSvc)
-
-	result, err := handler(context.Background(), makeReq(map[string]any{
-		"task_id":   "not-a-uuid",
-		"content":   "hi",
-		"post_type": "progress",
-	}))
-	require.NoError(t, err)
-	assert.Contains(t, resultText(result), "error: invalid task_id")
+	}
 }
 
 // ── getTaskContextHandler ─────────────────────────────────────────────────────
 
-func TestGetTaskContext_Success(t *testing.T) {
-	_, tSvc, thSvc, d := newToolsDeps(t)
-	handler := getTaskContextHandler(tSvc, thSvc)
+func TestGetTaskContextHandler(t *testing.T) {
+	tests := []struct {
+		name         string
+		taskIDStr    string
+		setup        func(d toolsDeps, taskID uuid.UUID)
+		wantContains string
+	}{
+		{
+			name: "success returns task, dependencies, and thread",
+			setup: func(d toolsDeps, taskID uuid.UUID) {
+				task := domaintask.Task{ID: taskID, Labels: []string{}}
+				thread := domainthread.Thread{ID: uuid.New()}
+				msg := domainthread.Message{ID: uuid.New(), Content: "update"}
+				d.taskRepo.EXPECT().GetByID(gomock.Any(), taskID).Return(task, nil)
+				d.taskRepo.EXPECT().GetDependencies(gomock.Any(), taskID).Return([]domaintask.Task{}, nil)
+				d.threadRepo.EXPECT().ListThreads(gomock.Any(), gomock.Any()).Return([]domainthread.Thread{thread}, nil)
+				d.threadRepo.EXPECT().ListMessages(gomock.Any(), thread.ID).Return([]domainthread.Message{msg}, nil)
+			},
+			wantContains: `"task"`,
+		},
+		{
+			name: "task not found returns error",
+			setup: func(d toolsDeps, taskID uuid.UUID) {
+				d.taskRepo.EXPECT().GetByID(gomock.Any(), taskID).Return(domaintask.Task{}, errors.New("not found"))
+			},
+			wantContains: "error:",
+		},
+		{
+			name: "no threads — thread field is null",
+			setup: func(d toolsDeps, taskID uuid.UUID) {
+				task := domaintask.Task{ID: taskID, Labels: []string{}}
+				d.taskRepo.EXPECT().GetByID(gomock.Any(), taskID).Return(task, nil)
+				d.taskRepo.EXPECT().GetDependencies(gomock.Any(), taskID).Return([]domaintask.Task{}, nil)
+				d.threadRepo.EXPECT().ListThreads(gomock.Any(), gomock.Any()).Return([]domainthread.Thread{}, nil)
+			},
+			wantContains: `"thread":null`,
+		},
+		{
+			name: "ListMessages fails — thread field is null (non-fatal)",
+			setup: func(d toolsDeps, taskID uuid.UUID) {
+				task := domaintask.Task{ID: taskID, Labels: []string{}}
+				thread := domainthread.Thread{ID: uuid.New()}
+				d.taskRepo.EXPECT().GetByID(gomock.Any(), taskID).Return(task, nil)
+				d.taskRepo.EXPECT().GetDependencies(gomock.Any(), taskID).Return([]domaintask.Task{}, nil)
+				d.threadRepo.EXPECT().ListThreads(gomock.Any(), gomock.Any()).Return([]domainthread.Thread{thread}, nil)
+				d.threadRepo.EXPECT().ListMessages(gomock.Any(), thread.ID).Return(nil, errors.New("db error"))
+			},
+			wantContains: `"thread":null`,
+		},
+		{
+			name:         "invalid task_id returns error",
+			taskIDStr:    "not-a-uuid",
+			setup:        func(d toolsDeps, taskID uuid.UUID) {},
+			wantContains: "error: invalid task_id",
+		},
+	}
 
-	taskID := uuid.New()
-	task := domaintask.Task{ID: taskID, Labels: []string{}}
-	thread := domainthread.Thread{ID: uuid.New()}
-	msg := domainthread.Message{ID: uuid.New(), Content: "update"}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, tSvc, thSvc, d := newToolsDeps(t)
+			handler := getTaskContextHandler(tSvc, thSvc)
 
-	d.taskRepo.EXPECT().GetByID(gomock.Any(), taskID).Return(task, nil)
-	d.taskRepo.EXPECT().GetDependencies(gomock.Any(), taskID).Return([]domaintask.Task{}, nil)
-	d.threadRepo.EXPECT().ListThreads(gomock.Any(), gomock.Any()).Return([]domainthread.Thread{thread}, nil)
-	d.threadRepo.EXPECT().ListMessages(gomock.Any(), thread.ID).Return([]domainthread.Message{msg}, nil)
+			taskID := uuid.New()
+			tt.setup(d, taskID)
 
-	result, err := handler(context.Background(), makeReq(map[string]any{"task_id": taskID.String()}))
-	require.NoError(t, err)
-	text := resultText(result)
-	assert.Contains(t, text, `"task"`)
-	assert.Contains(t, text, `"dependencies"`)
-	assert.Contains(t, text, `"thread"`)
-}
+			taskIDStr := tt.taskIDStr
+			if taskIDStr == "" {
+				taskIDStr = taskID.String()
+			}
 
-func TestGetTaskContext_TaskNotFound(t *testing.T) {
-	_, tSvc, thSvc, d := newToolsDeps(t)
-	handler := getTaskContextHandler(tSvc, thSvc)
-
-	taskID := uuid.New()
-	d.taskRepo.EXPECT().GetByID(gomock.Any(), taskID).Return(domaintask.Task{}, errors.New("not found"))
-
-	result, err := handler(context.Background(), makeReq(map[string]any{"task_id": taskID.String()}))
-	require.NoError(t, err)
-	assert.Contains(t, resultText(result), "error:")
-}
-
-func TestGetTaskContext_NoThreads(t *testing.T) {
-	// No threads → thread field is null in response.
-	_, tSvc, thSvc, d := newToolsDeps(t)
-	handler := getTaskContextHandler(tSvc, thSvc)
-
-	taskID := uuid.New()
-	task := domaintask.Task{ID: taskID, Labels: []string{}}
-
-	d.taskRepo.EXPECT().GetByID(gomock.Any(), taskID).Return(task, nil)
-	d.taskRepo.EXPECT().GetDependencies(gomock.Any(), taskID).Return([]domaintask.Task{}, nil)
-	d.threadRepo.EXPECT().ListThreads(gomock.Any(), gomock.Any()).Return([]domainthread.Thread{}, nil)
-
-	result, err := handler(context.Background(), makeReq(map[string]any{"task_id": taskID.String()}))
-	require.NoError(t, err)
-	text := resultText(result)
-	// messages stays nil → serialized as null.
-	assert.Contains(t, text, `"thread":null`)
-}
-
-func TestGetTaskContext_ListMessagesFails(t *testing.T) {
-	// ListMessages fails → thread field is null (non-fatal).
-	_, tSvc, thSvc, d := newToolsDeps(t)
-	handler := getTaskContextHandler(tSvc, thSvc)
-
-	taskID := uuid.New()
-	task := domaintask.Task{ID: taskID, Labels: []string{}}
-	thread := domainthread.Thread{ID: uuid.New()}
-
-	d.taskRepo.EXPECT().GetByID(gomock.Any(), taskID).Return(task, nil)
-	d.taskRepo.EXPECT().GetDependencies(gomock.Any(), taskID).Return([]domaintask.Task{}, nil)
-	d.threadRepo.EXPECT().ListThreads(gomock.Any(), gomock.Any()).Return([]domainthread.Thread{thread}, nil)
-	d.threadRepo.EXPECT().ListMessages(gomock.Any(), thread.ID).Return(nil, errors.New("db error"))
-
-	result, err := handler(context.Background(), makeReq(map[string]any{"task_id": taskID.String()}))
-	require.NoError(t, err)
-	text := resultText(result)
-	assert.Contains(t, text, `"thread":null`)
-}
-
-func TestGetTaskContext_InvalidTaskID(t *testing.T) {
-	_, tSvc, thSvc, _ := newToolsDeps(t)
-	handler := getTaskContextHandler(tSvc, thSvc)
-
-	result, err := handler(context.Background(), makeReq(map[string]any{"task_id": "not-a-uuid"}))
-	require.NoError(t, err)
-	assert.Contains(t, resultText(result), "error: invalid task_id")
+			result, err := handler(context.Background(), makeReq(map[string]any{"task_id": taskIDStr}))
+			require.NoError(t, err)
+			assert.Contains(t, resultText(result), tt.wantContains)
+		})
+	}
 }
 
 // ── setPRUrlHandler ───────────────────────────────────────────────────────────
 
-func TestSetPRUrl_Success(t *testing.T) {
-	_, tSvc, _, d := newToolsDeps(t)
-	handler := setPRUrlHandler(tSvc)
+func TestSetPRUrlHandler(t *testing.T) {
+	tests := []struct {
+		name         string
+		taskIDStr    string
+		prURL        string
+		setup        func(d toolsDeps, taskID uuid.UUID)
+		wantContains string
+	}{
+		{
+			name:  "success returns ok:true",
+			prURL: "https://github.com/pr/1",
+			setup: func(d toolsDeps, taskID uuid.UUID) {
+				d.taskRepo.EXPECT().SetPRUrl(gomock.Any(), taskID, "https://github.com/pr/1").Return(nil)
+				d.bus.EXPECT().Publish(gomock.Any(), gomock.Any()).Return(nil)
+			},
+			wantContains: `"ok":true`,
+		},
+		{
+			name:         "empty pr_url returns error",
+			prURL:        "",
+			setup:        func(d toolsDeps, taskID uuid.UUID) {},
+			wantContains: "error: pr_url required",
+		},
+		{
+			name:         "invalid task_id returns error",
+			taskIDStr:    "not-a-uuid",
+			prURL:        "https://github.com/pr/1",
+			setup:        func(d toolsDeps, taskID uuid.UUID) {},
+			wantContains: "error: invalid task_id",
+		},
+		{
+			name:  "service error returns error text",
+			prURL: "https://github.com/pr/1",
+			setup: func(d toolsDeps, taskID uuid.UUID) {
+				d.taskRepo.EXPECT().SetPRUrl(gomock.Any(), taskID, gomock.Any()).Return(errors.New("db error"))
+			},
+			wantContains: "error:",
+		},
+	}
 
-	taskID := uuid.New()
-	d.taskRepo.EXPECT().SetPRUrl(gomock.Any(), taskID, "https://github.com/pr/1").Return(nil)
-	d.bus.EXPECT().Publish(gomock.Any(), gomock.Any()).Return(nil)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, tSvc, _, d := newToolsDeps(t)
+			handler := setPRUrlHandler(tSvc)
 
-	result, err := handler(context.Background(), makeReq(map[string]any{
-		"task_id": taskID.String(),
-		"pr_url":  "https://github.com/pr/1",
-	}))
-	require.NoError(t, err)
-	assert.Contains(t, resultText(result), `"ok":true`)
-}
+			taskID := uuid.New()
+			tt.setup(d, taskID)
 
-func TestSetPRUrl_EmptyURL(t *testing.T) {
-	_, tSvc, _, _ := newToolsDeps(t)
-	handler := setPRUrlHandler(tSvc)
+			taskIDStr := tt.taskIDStr
+			if taskIDStr == "" {
+				taskIDStr = taskID.String()
+			}
 
-	result, err := handler(context.Background(), makeReq(map[string]any{
-		"task_id": uuid.New().String(),
-		"pr_url":  "",
-	}))
-	require.NoError(t, err)
-	assert.Contains(t, resultText(result), "error: pr_url required")
-}
-
-func TestSetPRUrl_InvalidTaskID(t *testing.T) {
-	_, tSvc, _, _ := newToolsDeps(t)
-	handler := setPRUrlHandler(tSvc)
-
-	result, err := handler(context.Background(), makeReq(map[string]any{
-		"task_id": "not-a-uuid",
-		"pr_url":  "https://github.com/pr/1",
-	}))
-	require.NoError(t, err)
-	assert.Contains(t, resultText(result), "error: invalid task_id")
-}
-
-func TestSetPRUrl_ServiceError(t *testing.T) {
-	_, tSvc, _, d := newToolsDeps(t)
-	handler := setPRUrlHandler(tSvc)
-
-	taskID := uuid.New()
-	d.taskRepo.EXPECT().SetPRUrl(gomock.Any(), taskID, gomock.Any()).Return(errors.New("db error"))
-
-	result, err := handler(context.Background(), makeReq(map[string]any{
-		"task_id": taskID.String(),
-		"pr_url":  "https://github.com/pr/1",
-	}))
-	require.NoError(t, err)
-	assert.Contains(t, resultText(result), "error:")
+			result, err := handler(context.Background(), makeReq(map[string]any{
+				"task_id": taskIDStr,
+				"pr_url":  tt.prURL,
+			}))
+			require.NoError(t, err)
+			assert.Contains(t, resultText(result), tt.wantContains)
+		})
+	}
 }
 
 // ── listMessagesHandler ───────────────────────────────────────────────────────
 
-func TestListMessages_Success(t *testing.T) {
-	_, _, thSvc, d := newToolsDeps(t)
-	handler := listMessagesHandler(thSvc)
+func TestListMessagesHandler(t *testing.T) {
+	tests := []struct {
+		name         string
+		taskIDStr    string
+		setup        func(d toolsDeps)
+		wantContains string
+	}{
+		{
+			name: "success returns messages",
+			setup: func(d toolsDeps) {
+				threadID := uuid.New()
+				thread := domainthread.Thread{ID: threadID}
+				msgs := []domainthread.Message{{ID: uuid.New(), Content: "msg1"}}
+				d.threadRepo.EXPECT().ListThreads(gomock.Any(), gomock.Any()).Return([]domainthread.Thread{thread}, nil)
+				d.threadRepo.EXPECT().ListMessages(gomock.Any(), threadID).Return(msgs, nil)
+			},
+			wantContains: "msg1",
+		},
+		{
+			name: "no thread returns empty array",
+			setup: func(d toolsDeps) {
+				d.threadRepo.EXPECT().ListThreads(gomock.Any(), gomock.Any()).Return([]domainthread.Thread{}, nil)
+			},
+			wantContains: "[]",
+		},
+		{
+			name: "ListMessages fails returns empty array",
+			setup: func(d toolsDeps) {
+				threadID := uuid.New()
+				thread := domainthread.Thread{ID: threadID}
+				d.threadRepo.EXPECT().ListThreads(gomock.Any(), gomock.Any()).Return([]domainthread.Thread{thread}, nil)
+				d.threadRepo.EXPECT().ListMessages(gomock.Any(), threadID).Return(nil, errors.New("db error"))
+			},
+			wantContains: "[]",
+		},
+		{
+			name:         "invalid task_id returns error",
+			taskIDStr:    "not-a-uuid",
+			setup:        func(d toolsDeps) {},
+			wantContains: "error: invalid task_id",
+		},
+	}
 
-	taskID := uuid.New()
-	threadID := uuid.New()
-	thread := domainthread.Thread{ID: threadID}
-	msgs := []domainthread.Message{{ID: uuid.New(), Content: "msg1"}}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, thSvc, d := newToolsDeps(t)
+			handler := listMessagesHandler(thSvc)
 
-	d.threadRepo.EXPECT().ListThreads(gomock.Any(), gomock.Any()).Return([]domainthread.Thread{thread}, nil)
-	d.threadRepo.EXPECT().ListMessages(gomock.Any(), threadID).Return(msgs, nil)
+			tt.setup(d)
 
-	result, err := handler(context.Background(), makeReq(map[string]any{"task_id": taskID.String()}))
-	require.NoError(t, err)
-	text := resultText(result)
-	assert.Contains(t, text, "msg1")
-}
+			taskIDStr := tt.taskIDStr
+			if taskIDStr == "" {
+				taskIDStr = uuid.New().String()
+			}
 
-func TestListMessages_NoThread(t *testing.T) {
-	_, _, thSvc, d := newToolsDeps(t)
-	handler := listMessagesHandler(thSvc)
-
-	d.threadRepo.EXPECT().ListThreads(gomock.Any(), gomock.Any()).Return([]domainthread.Thread{}, nil)
-
-	result, err := handler(context.Background(), makeReq(map[string]any{"task_id": uuid.New().String()}))
-	require.NoError(t, err)
-	assert.Equal(t, "[]", resultText(result))
-}
-
-func TestListMessages_ListMessagesFails(t *testing.T) {
-	_, _, thSvc, d := newToolsDeps(t)
-	handler := listMessagesHandler(thSvc)
-
-	threadID := uuid.New()
-	thread := domainthread.Thread{ID: threadID}
-
-	d.threadRepo.EXPECT().ListThreads(gomock.Any(), gomock.Any()).Return([]domainthread.Thread{thread}, nil)
-	d.threadRepo.EXPECT().ListMessages(gomock.Any(), threadID).Return(nil, errors.New("db error"))
-
-	result, err := handler(context.Background(), makeReq(map[string]any{"task_id": uuid.New().String()}))
-	require.NoError(t, err)
-	assert.Equal(t, "[]", resultText(result))
-}
-
-func TestListMessages_InvalidTaskID(t *testing.T) {
-	_, _, thSvc, _ := newToolsDeps(t)
-	handler := listMessagesHandler(thSvc)
-
-	result, err := handler(context.Background(), makeReq(map[string]any{"task_id": "not-a-uuid"}))
-	require.NoError(t, err)
-	assert.Contains(t, resultText(result), "error: invalid task_id")
+			result, err := handler(context.Background(), makeReq(map[string]any{"task_id": taskIDStr}))
+			require.NoError(t, err)
+			assert.Contains(t, resultText(result), tt.wantContains)
+		})
+	}
 }

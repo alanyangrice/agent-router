@@ -12,15 +12,14 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 
 	"github.com/alanyang/agent-mesh/internal/domain/pipeline"
 	domaintask "github.com/alanyang/agent-mesh/internal/domain/task"
 	domainthread "github.com/alanyang/agent-mesh/internal/domain/thread"
 	"github.com/alanyang/agent-mesh/internal/mocks"
-	tasksvc "github.com/alanyang/agent-mesh/internal/service/task"
 	"github.com/alanyang/agent-mesh/internal/service/distributor"
+	tasksvc "github.com/alanyang/agent-mesh/internal/service/task"
 	transporttask "github.com/alanyang/agent-mesh/internal/transport/task"
 )
 
@@ -61,8 +60,7 @@ func newRouter(svc *tasksvc.Service) *gin.Engine {
 	return r
 }
 
-// allowSweep makes the locker accept any sweep goroutine calls silently
-// and allows distributor to return no-agent (graceful no-op).
+// allowSweep silently absorbs any background sweep goroutine calls.
 func allowSweep(d taskDeps) {
 	d.locker.EXPECT().WithLock(gomock.Any(), gomock.Any(), gomock.Any()).
 		DoAndReturn(func(ctx context.Context, _ int64, fn func(context.Context) error) error {
@@ -73,252 +71,323 @@ func allowSweep(d taskDeps) {
 		Return(uuid.Nil, distributor.ErrNoAgentAvailable).AnyTimes()
 }
 
-// ── POST / (createTask) ────────────────────────────────────────────────────────
+// ── POST / (createTask) ───────────────────────────────────────────────────────
 
-func TestCreateTask_Success(t *testing.T) {
-	svc, d := newTaskSvc(t)
-	r := newRouter(svc)
-	projectID := uuid.New()
+func TestCreateTask(t *testing.T) {
+	tests := []struct {
+		name     string
+		body     map[string]interface{}
+		setup    func(d taskDeps)
+		wantCode int
+	}{
+		{
+			name: "success returns 201",
+			body: map[string]interface{}{
+				"project_id":  uuid.New().String(),
+				"title":       "Fix bug",
+				"priority":    "medium",
+				"branch_type": "fix",
+				"created_by":  "user",
+			},
+			setup: func(d taskDeps) {
+				created := domaintask.Task{ID: uuid.New(), Labels: []string{}}
+				d.taskRepo.EXPECT().Create(gomock.Any(), gomock.Any()).Return(created, nil)
+				d.threadRepo.EXPECT().CreateThread(gomock.Any(), gomock.Any()).Return(domainthread.Thread{}, nil)
+				d.bus.EXPECT().Publish(gomock.Any(), gomock.Any()).Return(nil)
+			},
+			wantCode: http.StatusCreated,
+		},
+		{
+			name:     "missing required fields returns 400",
+			body:     map[string]interface{}{},
+			setup:    func(d taskDeps) {},
+			wantCode: http.StatusBadRequest,
+		},
+	}
 
-	created := domaintask.Task{ID: uuid.New(), ProjectID: projectID, Labels: []string{}}
-	d.taskRepo.EXPECT().Create(gomock.Any(), gomock.Any()).Return(created, nil)
-	d.threadRepo.EXPECT().CreateThread(gomock.Any(), gomock.Any()).Return(domainthread.Thread{}, nil)
-	d.bus.EXPECT().Publish(gomock.Any(), gomock.Any()).Return(nil)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, d := newTaskSvc(t)
+			tt.setup(d)
+			r := newRouter(svc)
 
-	body, _ := json.Marshal(map[string]interface{}{
-		"project_id":  projectID.String(),
-		"title":       "Fix bug",
-		"priority":    "medium",
-		"branch_type": "fix",
-		"created_by":  "user",
-	})
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, "/tasks/", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	r.ServeHTTP(w, req)
+			body, _ := json.Marshal(tt.body)
+			w := httptest.NewRecorder()
+			req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, "/tasks/", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			r.ServeHTTP(w, req)
 
-	assert.Equal(t, http.StatusCreated, w.Code)
-	var got domaintask.Task
-	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
-	assert.Equal(t, created.ID, got.ID)
-}
-
-func TestCreateTask_BadBody(t *testing.T) {
-	svc, _ := newTaskSvc(t)
-	r := newRouter(svc)
-
-	body, _ := json.Marshal(map[string]string{}) // missing required fields
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, "/tasks/", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	r.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusBadRequest, w.Code)
+			assert.Equal(t, tt.wantCode, w.Code)
+		})
+	}
 }
 
 // ── GET / (listTasks) ─────────────────────────────────────────────────────────
 
-func TestListTasks_Success(t *testing.T) {
-	svc, d := newTaskSvc(t)
-	r := newRouter(svc)
+func TestListTasks(t *testing.T) {
+	tests := []struct {
+		name     string
+		query    string
+		setup    func(d taskDeps)
+		wantCode int
+	}{
+		{
+			name: "success returns 200",
+			setup: func(d taskDeps) {
+				d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).
+					Return([]domaintask.Task{{ID: uuid.New(), Labels: []string{}}}, nil)
+			},
+			wantCode: http.StatusOK,
+		},
+		{
+			name:     "invalid project_id returns 400",
+			query:    "?project_id=not-a-uuid",
+			setup:    func(d taskDeps) {},
+			wantCode: http.StatusBadRequest,
+		},
+		{
+			name:     "invalid assigned_to returns 400",
+			query:    "?assigned_to=not-a-uuid",
+			setup:    func(d taskDeps) {},
+			wantCode: http.StatusBadRequest,
+		},
+	}
 
-	d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).Return([]domaintask.Task{{ID: uuid.New(), Labels: []string{}}}, nil)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, d := newTaskSvc(t)
+			tt.setup(d)
+			r := newRouter(svc)
 
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/tasks/", nil)
-	r.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusOK, w.Code)
-}
+			w := httptest.NewRecorder()
+			req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/tasks/"+tt.query, nil)
+			r.ServeHTTP(w, req)
 
-func TestListTasks_InvalidProjectID(t *testing.T) {
-	svc, _ := newTaskSvc(t)
-	r := newRouter(svc)
-
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/tasks/?project_id=not-a-uuid", nil)
-	r.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusBadRequest, w.Code)
-}
-
-func TestListTasks_InvalidAssignedTo(t *testing.T) {
-	svc, _ := newTaskSvc(t)
-	r := newRouter(svc)
-
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/tasks/?assigned_to=not-a-uuid", nil)
-	r.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusBadRequest, w.Code)
+			assert.Equal(t, tt.wantCode, w.Code)
+		})
+	}
 }
 
 // ── GET /:id (getTask) ────────────────────────────────────────────────────────
 
-func TestGetTask_Success(t *testing.T) {
-	svc, d := newTaskSvc(t)
-	r := newRouter(svc)
-	taskID := uuid.New()
+func TestGetTask(t *testing.T) {
+	tests := []struct {
+		name     string
+		id       string
+		setup    func(d taskDeps, taskID uuid.UUID)
+		wantCode int
+	}{
+		{
+			name: "success returns 200",
+			setup: func(d taskDeps, taskID uuid.UUID) {
+				d.taskRepo.EXPECT().GetByID(gomock.Any(), taskID).
+					Return(domaintask.Task{ID: taskID, Labels: []string{}}, nil)
+			},
+			wantCode: http.StatusOK,
+		},
+		{
+			name:     "invalid UUID returns 400",
+			id:       "not-a-uuid",
+			setup:    func(d taskDeps, taskID uuid.UUID) {},
+			wantCode: http.StatusBadRequest,
+		},
+		{
+			name: "not found returns 404",
+			setup: func(d taskDeps, taskID uuid.UUID) {
+				d.taskRepo.EXPECT().GetByID(gomock.Any(), taskID).
+					Return(domaintask.Task{}, errors.New("task not found"))
+			},
+			wantCode: http.StatusNotFound,
+		},
+	}
 
-	d.taskRepo.EXPECT().GetByID(gomock.Any(), taskID).Return(domaintask.Task{ID: taskID, Labels: []string{}}, nil)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, d := newTaskSvc(t)
+			taskID := uuid.New()
+			tt.setup(d, taskID)
+			r := newRouter(svc)
 
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/tasks/"+taskID.String(), nil)
-	r.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusOK, w.Code)
-}
+			id := tt.id
+			if id == "" {
+				id = taskID.String()
+			}
 
-func TestGetTask_InvalidID(t *testing.T) {
-	svc, _ := newTaskSvc(t)
-	r := newRouter(svc)
+			w := httptest.NewRecorder()
+			req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/tasks/"+id, nil)
+			r.ServeHTTP(w, req)
 
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/tasks/not-a-uuid", nil)
-	r.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusBadRequest, w.Code)
-}
-
-func TestGetTask_NotFound(t *testing.T) {
-	svc, d := newTaskSvc(t)
-	r := newRouter(svc)
-	taskID := uuid.New()
-
-	d.taskRepo.EXPECT().GetByID(gomock.Any(), taskID).Return(domaintask.Task{}, errors.New("task not found"))
-
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/tasks/"+taskID.String(), nil)
-	r.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusNotFound, w.Code)
+			assert.Equal(t, tt.wantCode, w.Code)
+		})
+	}
 }
 
 // ── PATCH /:id (updateTaskStatus) ────────────────────────────────────────────
 
-func TestUpdateTaskStatus_Success(t *testing.T) {
-	svc, d := newTaskSvc(t)
-	r := newRouter(svc)
-	taskID := uuid.New()
-	projectID := uuid.New()
-	// Use in_qa→in_review so no bounce-back special case, and reviewer gets assigned (or not).
-	task := domaintask.Task{ID: taskID, ProjectID: projectID, Status: domaintask.StatusInReview, Labels: []string{}}
+func TestUpdateTaskStatus(t *testing.T) {
+	tests := []struct {
+		name     string
+		id       string
+		body     map[string]string
+		setup    func(d taskDeps, taskID uuid.UUID)
+		wantCode int
+	}{
+		{
+			name: "success returns 200",
+			body: map[string]string{"status_from": "in_qa", "status_to": "in_review"},
+			setup: func(d taskDeps, taskID uuid.UUID) {
+				projectID := uuid.New()
+				task := domaintask.Task{ID: taskID, ProjectID: projectID, Status: domaintask.StatusInReview, Labels: []string{}}
+				d.taskRepo.EXPECT().UpdateStatus(gomock.Any(), taskID, domaintask.StatusInQA, domaintask.StatusInReview).Return(nil)
+				d.bus.EXPECT().Publish(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+				d.taskRepo.EXPECT().GetByID(gomock.Any(), taskID).Return(task, nil).AnyTimes()
+				allowSweep(d)
+			},
+			wantCode: http.StatusOK,
+		},
+		{
+			name:     "invalid transition returns 409",
+			body:     map[string]string{"status_from": "merged", "status_to": "in_progress"},
+			setup:    func(d taskDeps, taskID uuid.UUID) {},
+			wantCode: http.StatusConflict,
+		},
+		{
+			name: "db error returns 500",
+			body: map[string]string{"status_from": "backlog", "status_to": "ready"},
+			setup: func(d taskDeps, taskID uuid.UUID) {
+				d.taskRepo.EXPECT().UpdateStatus(gomock.Any(), taskID, domaintask.StatusBacklog, domaintask.StatusReady).
+					Return(errors.New("unexpected db failure"))
+			},
+			wantCode: http.StatusInternalServerError,
+		},
+		{
+			name:     "missing required fields returns 400",
+			body:     map[string]string{},
+			setup:    func(d taskDeps, taskID uuid.UUID) {},
+			wantCode: http.StatusBadRequest,
+		},
+		{
+			name:     "invalid task UUID returns 400",
+			id:       "not-a-uuid",
+			body:     map[string]string{"status_from": "backlog", "status_to": "ready"},
+			setup:    func(d taskDeps, taskID uuid.UUID) {},
+			wantCode: http.StatusBadRequest,
+		},
+	}
 
-	d.taskRepo.EXPECT().UpdateStatus(gomock.Any(), taskID, domaintask.StatusInQA, domaintask.StatusInReview).Return(nil)
-	d.bus.EXPECT().Publish(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
-	d.taskRepo.EXPECT().GetByID(gomock.Any(), taskID).Return(task, nil).AnyTimes()
-	allowSweep(d) // handles sweep goroutine + dist calls
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, d := newTaskSvc(t)
+			taskID := uuid.New()
+			tt.setup(d, taskID)
+			r := newRouter(svc)
 
-	body, _ := json.Marshal(map[string]string{"status_from": "in_qa", "status_to": "in_review"})
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPatch, "/tasks/"+taskID.String(), bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	r.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusOK, w.Code)
-}
+			id := tt.id
+			if id == "" {
+				id = taskID.String()
+			}
 
-func TestUpdateTaskStatus_InvalidTransition_Returns409(t *testing.T) {
-	svc, _ := newTaskSvc(t)
-	r := newRouter(svc)
-	taskID := uuid.New()
+			body, _ := json.Marshal(tt.body)
+			w := httptest.NewRecorder()
+			req, _ := http.NewRequestWithContext(context.Background(), http.MethodPatch, "/tasks/"+id, bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			r.ServeHTTP(w, req)
 
-	body, _ := json.Marshal(map[string]string{"status_from": "merged", "status_to": "in_progress"})
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPatch, "/tasks/"+taskID.String(), bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	r.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusConflict, w.Code)
-}
-
-func TestUpdateTaskStatus_ServiceError_Returns500(t *testing.T) {
-	// Non-transition error (e.g. DB failure) → 500.
-	svc, d := newTaskSvc(t)
-	r := newRouter(svc)
-	taskID := uuid.New()
-
-	d.taskRepo.EXPECT().UpdateStatus(gomock.Any(), taskID, domaintask.StatusBacklog, domaintask.StatusReady).
-		Return(errors.New("unexpected db failure"))
-
-	body, _ := json.Marshal(map[string]string{"status_from": "backlog", "status_to": "ready"})
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPatch, "/tasks/"+taskID.String(), bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	r.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusInternalServerError, w.Code)
-}
-
-func TestUpdateTaskStatus_BadBody(t *testing.T) {
-	svc, _ := newTaskSvc(t)
-	r := newRouter(svc)
-	taskID := uuid.New()
-
-	body, _ := json.Marshal(map[string]string{}) // missing required fields
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPatch, "/tasks/"+taskID.String(), bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	r.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusBadRequest, w.Code)
-}
-
-func TestUpdateTaskStatus_InvalidID(t *testing.T) {
-	svc, _ := newTaskSvc(t)
-	r := newRouter(svc)
-
-	body, _ := json.Marshal(map[string]string{"status_from": "backlog", "status_to": "ready"})
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPatch, "/tasks/not-a-uuid", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	r.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusBadRequest, w.Code)
+			assert.Equal(t, tt.wantCode, w.Code)
+		})
+	}
 }
 
 // ── POST /:id/dependencies ────────────────────────────────────────────────────
 
-func TestAddDependency_Success(t *testing.T) {
-	svc, d := newTaskSvc(t)
-	r := newRouter(svc)
-	taskID, depID := uuid.New(), uuid.New()
+func TestAddDependency(t *testing.T) {
+	tests := []struct {
+		name     string
+		body     map[string]string
+		setup    func(d taskDeps, taskID, depID uuid.UUID)
+		wantCode int
+	}{
+		{
+			name: "success returns 201",
+			setup: func(d taskDeps, taskID, depID uuid.UUID) {
+				d.taskRepo.EXPECT().AddDependency(gomock.Any(),
+					domaintask.Dependency{TaskID: taskID, DependsOnID: depID}).Return(nil)
+			},
+			wantCode: http.StatusCreated,
+		},
+		{
+			name:     "missing depends_on_id returns 400",
+			body:     map[string]string{},
+			setup:    func(d taskDeps, taskID, depID uuid.UUID) {},
+			wantCode: http.StatusBadRequest,
+		},
+	}
 
-	d.taskRepo.EXPECT().AddDependency(gomock.Any(), domaintask.Dependency{TaskID: taskID, DependsOnID: depID}).Return(nil)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, d := newTaskSvc(t)
+			taskID, depID := uuid.New(), uuid.New()
+			tt.setup(d, taskID, depID)
+			r := newRouter(svc)
 
-	body, _ := json.Marshal(map[string]string{"depends_on_id": depID.String()})
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, "/tasks/"+taskID.String()+"/dependencies", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	r.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusCreated, w.Code)
-}
+			bodyMap := tt.body
+			if bodyMap == nil {
+				bodyMap = map[string]string{"depends_on_id": depID.String()}
+			}
+			body, _ := json.Marshal(bodyMap)
+			w := httptest.NewRecorder()
+			req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost,
+				"/tasks/"+taskID.String()+"/dependencies", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			r.ServeHTTP(w, req)
 
-func TestAddDependency_BadBody(t *testing.T) {
-	svc, _ := newTaskSvc(t)
-	r := newRouter(svc)
-	taskID := uuid.New()
-
-	body, _ := json.Marshal(map[string]string{}) // missing depends_on_id
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, "/tasks/"+taskID.String()+"/dependencies", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	r.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusBadRequest, w.Code)
+			assert.Equal(t, tt.wantCode, w.Code)
+		})
+	}
 }
 
 // ── DELETE /:id/dependencies/:depId ──────────────────────────────────────────
 
-func TestRemoveDependency_Success(t *testing.T) {
-	svc, d := newTaskSvc(t)
-	r := newRouter(svc)
-	taskID, depID := uuid.New(), uuid.New()
+func TestRemoveDependency(t *testing.T) {
+	tests := []struct {
+		name     string
+		depID    string
+		setup    func(d taskDeps, taskID, depID uuid.UUID)
+		wantCode int
+	}{
+		{
+			name: "success returns 204",
+			setup: func(d taskDeps, taskID, depID uuid.UUID) {
+				d.taskRepo.EXPECT().RemoveDependency(gomock.Any(), taskID, depID).Return(nil)
+			},
+			wantCode: http.StatusNoContent,
+		},
+		{
+			name:     "invalid dep UUID returns 400",
+			depID:    "not-a-uuid",
+			setup:    func(d taskDeps, taskID, depID uuid.UUID) {},
+			wantCode: http.StatusBadRequest,
+		},
+	}
 
-	d.taskRepo.EXPECT().RemoveDependency(gomock.Any(), taskID, depID).Return(nil)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, d := newTaskSvc(t)
+			taskID, depID := uuid.New(), uuid.New()
+			tt.setup(d, taskID, depID)
+			r := newRouter(svc)
 
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodDelete,
-		"/tasks/"+taskID.String()+"/dependencies/"+depID.String(), nil)
-	r.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusNoContent, w.Code)
-}
+			depIDStr := tt.depID
+			if depIDStr == "" {
+				depIDStr = depID.String()
+			}
 
-func TestRemoveDependency_InvalidDepID(t *testing.T) {
-	svc, _ := newTaskSvc(t)
-	r := newRouter(svc)
-	taskID := uuid.New()
+			w := httptest.NewRecorder()
+			req, _ := http.NewRequestWithContext(context.Background(), http.MethodDelete,
+				"/tasks/"+taskID.String()+"/dependencies/"+depIDStr, nil)
+			r.ServeHTTP(w, req)
 
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodDelete,
-		"/tasks/"+taskID.String()+"/dependencies/not-a-uuid", nil)
-	r.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusBadRequest, w.Code)
+			assert.Equal(t, tt.wantCode, w.Code)
+		})
+	}
 }

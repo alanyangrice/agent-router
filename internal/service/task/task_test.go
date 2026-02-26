@@ -16,11 +16,11 @@ import (
 	domaintask "github.com/alanyang/agent-mesh/internal/domain/task"
 	domainthread "github.com/alanyang/agent-mesh/internal/domain/thread"
 	"github.com/alanyang/agent-mesh/internal/mocks"
-	tasksvc "github.com/alanyang/agent-mesh/internal/service/task"
 	"github.com/alanyang/agent-mesh/internal/service/distributor"
+	tasksvc "github.com/alanyang/agent-mesh/internal/service/task"
 )
 
-// ── test helpers ──────────────────────────────────────────────────────────────
+// ── helpers ───────────────────────────────────────────────────────────────────
 
 type svcDeps struct {
 	taskRepo      *mocks.MockTaskRepository
@@ -85,717 +85,807 @@ func (m eventTypeMatcher) Matches(x interface{}) bool {
 }
 func (m eventTypeMatcher) String() string { return "event.Type=" + string(m.want) }
 
+// sweepNoOp allows an optional background sweep goroutine with no tasks found.
+// Adds 1 to wg; the DoAndReturn calls wg.Done when the goroutine runs.
+func sweepNoOp(d svcDeps, wg *sync.WaitGroup) {
+	d.locker.EXPECT().WithLock(gomock.Any(), gomock.Any(), gomock.Any()).
+		DoAndReturn(func(ctx context.Context, _ int64, fn func(context.Context) error) error {
+			defer wg.Done()
+			return fn(ctx)
+		})
+	d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).Return([]domaintask.Task{}, nil).AnyTimes()
+}
+
 // ── Create ────────────────────────────────────────────────────────────────────
 
-func TestCreate_Success(t *testing.T) {
-	svc, d := newTaskSvc(t, pipeline.DefaultConfig)
-	ctx := context.Background()
-	projectID := uuid.New()
+func TestCreate(t *testing.T) {
+	tests := []struct {
+		name    string
+		setup   func(d svcDeps) domaintask.Task
+		wantErr bool
+		wantMsg string
+	}{
+		{
+			name: "success creates task and thread",
+			setup: func(d svcDeps) domaintask.Task {
+				projectID := uuid.New()
+				created := domaintask.Task{ID: uuid.New(), ProjectID: projectID, Status: domaintask.StatusBacklog, Labels: []string{}}
+				d.taskRepo.EXPECT().Create(gomock.Any(), gomock.Any()).Return(created, nil)
+				d.threadRepo.EXPECT().CreateThread(gomock.Any(), gomock.Any()).Return(domainthread.Thread{}, nil)
+				d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskCreated)).Return(nil)
+				return created
+			},
+		},
+		{
+			name: "repo error",
+			setup: func(d svcDeps) domaintask.Task {
+				d.taskRepo.EXPECT().Create(gomock.Any(), gomock.Any()).Return(domaintask.Task{}, errors.New("db error"))
+				return domaintask.Task{}
+			},
+			wantErr: true,
+			wantMsg: "create task",
+		},
+		{
+			// Thread creation failure is non-fatal — task is still returned.
+			name: "thread creation failure is non-fatal",
+			setup: func(d svcDeps) domaintask.Task {
+				created := domaintask.Task{ID: uuid.New(), Labels: []string{}}
+				d.taskRepo.EXPECT().Create(gomock.Any(), gomock.Any()).Return(created, nil)
+				d.threadRepo.EXPECT().CreateThread(gomock.Any(), gomock.Any()).
+					Return(domainthread.Thread{}, errors.New("thread error"))
+				d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskCreated)).Return(nil)
+				return created
+			},
+		},
+	}
 
-	created := domaintask.Task{ID: uuid.New(), ProjectID: projectID, Status: domaintask.StatusBacklog, Labels: []string{}}
-	d.taskRepo.EXPECT().Create(gomock.Any(), gomock.Any()).Return(created, nil)
-	d.threadRepo.EXPECT().CreateThread(gomock.Any(), gomock.Any()).Return(domainthread.Thread{}, nil)
-	d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskCreated)).Return(nil)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, d := newTaskSvc(t, pipeline.DefaultConfig)
+			expected := tt.setup(d)
 
-	got, err := svc.Create(ctx, projectID, "Fix bug", "desc", domaintask.PriorityMedium, domaintask.BranchFix, "user")
-	require.NoError(t, err)
-	assert.Equal(t, created.ID, got.ID)
-}
-
-func TestCreate_RepoError(t *testing.T) {
-	svc, d := newTaskSvc(t, pipeline.DefaultConfig)
-
-	d.taskRepo.EXPECT().Create(gomock.Any(), gomock.Any()).Return(domaintask.Task{}, errors.New("db error"))
-
-	_, err := svc.Create(context.Background(), uuid.New(), "title", "desc", domaintask.PriorityLow, domaintask.BranchFix, "user")
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "create task")
-}
-
-func TestCreate_ThreadCreationFails(t *testing.T) {
-	// Non-fatal: task is returned even if thread creation fails.
-	svc, d := newTaskSvc(t, pipeline.DefaultConfig)
-
-	created := domaintask.Task{ID: uuid.New(), Labels: []string{}}
-	d.taskRepo.EXPECT().Create(gomock.Any(), gomock.Any()).Return(created, nil)
-	d.threadRepo.EXPECT().CreateThread(gomock.Any(), gomock.Any()).Return(domainthread.Thread{}, errors.New("thread error"))
-	d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskCreated)).Return(nil)
-
-	got, err := svc.Create(context.Background(), uuid.New(), "title", "", domaintask.PriorityLow, domaintask.BranchFix, "user")
-	require.NoError(t, err)
-	assert.Equal(t, created.ID, got.ID)
+			got, err := svc.Create(context.Background(), uuid.New(), "Fix bug", "desc", domaintask.PriorityMedium, domaintask.BranchFix, "user")
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantMsg)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, expected.ID, got.ID)
+		})
+	}
 }
 
 // ── GetByID / List ────────────────────────────────────────────────────────────
 
-func TestGetByID_Success(t *testing.T) {
-	svc, d := newTaskSvc(t, pipeline.DefaultConfig)
-	task := newTask(domaintask.StatusReady)
-	d.taskRepo.EXPECT().GetByID(gomock.Any(), task.ID).Return(task, nil)
+func TestGetByID(t *testing.T) {
+	tests := []struct {
+		name    string
+		setup   func(d svcDeps, taskID uuid.UUID)
+		wantErr bool
+	}{
+		{
+			name: "success",
+			setup: func(d svcDeps, taskID uuid.UUID) {
+				task := domaintask.Task{ID: taskID, Status: domaintask.StatusReady, Labels: []string{}}
+				d.taskRepo.EXPECT().GetByID(gomock.Any(), taskID).Return(task, nil)
+			},
+		},
+		{
+			name: "not found",
+			setup: func(d svcDeps, taskID uuid.UUID) {
+				d.taskRepo.EXPECT().GetByID(gomock.Any(), taskID).Return(domaintask.Task{}, errors.New("not found"))
+			},
+			wantErr: true,
+		},
+	}
 
-	got, err := svc.GetByID(context.Background(), task.ID)
-	require.NoError(t, err)
-	assert.Equal(t, task.ID, got.ID)
-}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, d := newTaskSvc(t, pipeline.DefaultConfig)
+			taskID := uuid.New()
+			tt.setup(d, taskID)
 
-func TestGetByID_NotFound(t *testing.T) {
-	svc, d := newTaskSvc(t, pipeline.DefaultConfig)
-	taskID := uuid.New()
-	d.taskRepo.EXPECT().GetByID(gomock.Any(), taskID).Return(domaintask.Task{}, errors.New("not found"))
-
-	_, err := svc.GetByID(context.Background(), taskID)
-	require.Error(t, err)
-}
-
-func TestList_Success(t *testing.T) {
-	svc, d := newTaskSvc(t, pipeline.DefaultConfig)
-	tasks := []domaintask.Task{newTask(domaintask.StatusReady)}
-	d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).Return(tasks, nil)
-
-	got, err := svc.List(context.Background(), domaintask.ListFilters{})
-	require.NoError(t, err)
-	assert.Len(t, got, 1)
-}
-
-func TestList_Error(t *testing.T) {
-	svc, d := newTaskSvc(t, pipeline.DefaultConfig)
-	d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).Return(nil, errors.New("db error"))
-
-	_, err := svc.List(context.Background(), domaintask.ListFilters{})
-	require.Error(t, err)
-}
-
-// ── UpdateStatus — invalid transition ────────────────────────────────────────
-
-func TestUpdateStatus_InvalidTransition(t *testing.T) {
-	svc, _ := newTaskSvc(t, pipeline.DefaultConfig)
-
-	err := svc.UpdateStatus(context.Background(), uuid.New(), domaintask.StatusMerged, domaintask.StatusInProgress)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "invalid transition")
-}
-
-// ── UpdateStatus — repo/fetch error paths ────────────────────────────────────
-
-func TestUpdateStatus_RepoUpdateFails(t *testing.T) {
-	svc, d := newTaskSvc(t, pipeline.DefaultConfig)
-	taskID := uuid.New()
-
-	d.taskRepo.EXPECT().UpdateStatus(gomock.Any(), taskID, domaintask.StatusBacklog, domaintask.StatusReady).
-		Return(errors.New("db error"))
-
-	err := svc.UpdateStatus(context.Background(), taskID, domaintask.StatusBacklog, domaintask.StatusReady)
-	require.Error(t, err)
-}
-
-func TestUpdateStatus_GetByIDFails(t *testing.T) {
-	// TypeTaskUpdated IS published before GetByID fails.
-	svc, d := newTaskSvc(t, pipeline.DefaultConfig)
-	taskID := uuid.New()
-
-	d.taskRepo.EXPECT().UpdateStatus(gomock.Any(), taskID, domaintask.StatusBacklog, domaintask.StatusReady).Return(nil)
-	d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskUpdated)).Return(nil)
-	d.taskRepo.EXPECT().GetByID(gomock.Any(), taskID).Return(domaintask.Task{}, errors.New("db error"))
-
-	err := svc.UpdateStatus(context.Background(), taskID, domaintask.StatusBacklog, domaintask.StatusReady)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "fetch task after status update")
-}
-
-func TestUpdateStatus_BounceBack_AssignIfIdleError(t *testing.T) {
-	svc, d := newTaskSvc(t, pipeline.DefaultConfig)
-	task := newTask(domaintask.StatusInQA)
-	coderID := uuid.New()
-	task.CoderID = &coderID
-
-	d.taskRepo.EXPECT().UpdateStatus(gomock.Any(), task.ID, domaintask.StatusInQA, domaintask.StatusInProgress).Return(nil)
-	d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskUpdated)).Return(nil)
-	d.taskRepo.EXPECT().GetByID(gomock.Any(), task.ID).Return(task, nil)
-	d.taskRepo.EXPECT().AssignIfIdle(gomock.Any(), task.ID, coderID).Return(false, errors.New("db error"))
-
-	err := svc.UpdateStatus(context.Background(), task.ID, domaintask.StatusInQA, domaintask.StatusInProgress)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "bounce-back preferred assign")
-}
-
-func TestUpdateStatus_BounceBack_FallbackAssignFails(t *testing.T) {
-	svc, d := newTaskSvc(t, pipeline.DefaultConfig)
-	task := newTask(domaintask.StatusInQA)
-	coderID := uuid.New()
-	task.CoderID = &coderID
-	newAgentID := uuid.New()
-
-	d.taskRepo.EXPECT().UpdateStatus(gomock.Any(), task.ID, domaintask.StatusInQA, domaintask.StatusInProgress).Return(nil)
-	d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskUpdated)).Return(nil)
-	d.taskRepo.EXPECT().GetByID(gomock.Any(), task.ID).Return(task, nil)
-	d.taskRepo.EXPECT().AssignIfIdle(gomock.Any(), task.ID, coderID).Return(false, nil) // coder busy
-	d.dist.EXPECT().Distribute(gomock.Any(), task.ProjectID, "coder").Return(newAgentID, nil)
-	d.taskRepo.EXPECT().Assign(gomock.Any(), task.ID, newAgentID).Return(errors.New("db error"))
-
-	err := svc.UpdateStatus(context.Background(), task.ID, domaintask.StatusInQA, domaintask.StatusInProgress)
-	require.Error(t, err)
-}
-
-// ── UpdateStatus — no pipeline action ────────────────────────────────────────
-
-func TestUpdateStatus_NoPipelineAction(t *testing.T) {
-	// backlog→ready: pipelineConfig[ready].AssignRole="coder" — assign fires.
-	// Use a config with no entry for statusReady to test the "no action" path.
-	emptyCfg := pipeline.Config{}
-	svc, d := newTaskSvc(t, emptyCfg)
-	taskID := uuid.New()
-	task := domaintask.Task{ID: taskID, ProjectID: uuid.New(), Labels: []string{}}
-
-	d.taskRepo.EXPECT().UpdateStatus(gomock.Any(), taskID, domaintask.StatusBacklog, domaintask.StatusReady).Return(nil)
-	d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskUpdated)).Return(nil)
-	d.taskRepo.EXPECT().GetByID(gomock.Any(), taskID).Return(task, nil)
-
-	err := svc.UpdateStatus(context.Background(), taskID, domaintask.StatusBacklog, domaintask.StatusReady)
-	require.NoError(t, err)
-}
-
-func TestUpdateStatus_ReadyToBacklog(t *testing.T) {
-	// ready→backlog: valid domain transition; no DefaultConfig entry for backlog.
-	svc, d := newTaskSvc(t, pipeline.DefaultConfig)
-	taskID := uuid.New()
-	task := domaintask.Task{ID: taskID, ProjectID: uuid.New(), Labels: []string{}}
-
-	d.taskRepo.EXPECT().UpdateStatus(gomock.Any(), taskID, domaintask.StatusReady, domaintask.StatusBacklog).Return(nil)
-	d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskUpdated)).Return(nil)
-	d.taskRepo.EXPECT().GetByID(gomock.Any(), taskID).Return(task, nil)
-
-	err := svc.UpdateStatus(context.Background(), taskID, domaintask.StatusReady, domaintask.StatusBacklog)
-	require.NoError(t, err)
-}
-
-func TestUpdateStatus_InProgressToReady_DirectTransition(t *testing.T) {
-	// in_progress→ready: NOT a bounce-back (from is neither InQA nor InReview).
-	// pipelineConfig[ready].AssignRole="coder" → Distribute called.
-	svc, d := newTaskSvc(t, pipeline.DefaultConfig)
-	taskID := uuid.New()
-	agentID := uuid.New()
-	projectID := uuid.New()
-	task := domaintask.Task{ID: taskID, ProjectID: projectID, Labels: []string{}}
-
-	d.taskRepo.EXPECT().UpdateStatus(gomock.Any(), taskID, domaintask.StatusInProgress, domaintask.StatusReady).Return(nil)
-	d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskUpdated)).Return(nil)
-	d.taskRepo.EXPECT().GetByID(gomock.Any(), taskID).Return(task, nil)
-	d.dist.EXPECT().Distribute(gomock.Any(), projectID, "coder").Return(agentID, nil)
-	d.taskRepo.EXPECT().Assign(gomock.Any(), taskID, agentID).Return(nil)
-	d.agentNotifier.EXPECT().NotifyAgent(gomock.Any(), agentID, gomock.Any()).Return(nil)
-	d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskAssigned)).Return(nil)
-	// pipelineConfig[in_progress].FreedRole="coder" → sweep goroutine fires.
-	var wg sync.WaitGroup
-	wg.Add(1)
-	d.locker.EXPECT().WithLock(gomock.Any(), gomock.Any(), gomock.Any()).
-		DoAndReturn(func(ctx context.Context, key int64, fn func(context.Context) error) error {
-			defer wg.Done()
-			return fn(ctx)
+			got, err := svc.GetByID(context.Background(), taskID)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, taskID, got.ID)
 		})
-	d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).Return([]domaintask.Task{}, nil).AnyTimes()
-
-	err := svc.UpdateStatus(context.Background(), taskID, domaintask.StatusInProgress, domaintask.StatusReady)
-	wg.Wait()
-	require.NoError(t, err)
+	}
 }
 
-// ── UpdateStatus — pipeline assigns a role ────────────────────────────────────
+func TestList(t *testing.T) {
+	tests := []struct {
+		name    string
+		setup   func(d svcDeps)
+		wantLen int
+		wantErr bool
+	}{
+		{
+			name: "success",
+			setup: func(d svcDeps) {
+				d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).
+					Return([]domaintask.Task{newTask(domaintask.StatusReady)}, nil)
+			},
+			wantLen: 1,
+		},
+		{
+			name: "repo error",
+			setup: func(d svcDeps) {
+				d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).Return(nil, errors.New("db error"))
+			},
+			wantErr: true,
+		},
+	}
 
-func TestUpdateStatus_PipelineAssignRole_AgentAvailable(t *testing.T) {
-	svc, d := newTaskSvc(t, pipeline.DefaultConfig)
-	task := newTask(domaintask.StatusInProgress)
-	qaAgentID := uuid.New()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, d := newTaskSvc(t, pipeline.DefaultConfig)
+			tt.setup(d)
 
-	d.taskRepo.EXPECT().UpdateStatus(gomock.Any(), task.ID, domaintask.StatusInProgress, domaintask.StatusInQA).Return(nil)
-	d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskUpdated)).Return(nil)
-	d.taskRepo.EXPECT().GetByID(gomock.Any(), task.ID).Return(task, nil)
-	d.dist.EXPECT().Distribute(gomock.Any(), task.ProjectID, "qa").Return(qaAgentID, nil)
-	d.taskRepo.EXPECT().Assign(gomock.Any(), task.ID, qaAgentID).Return(nil)
-	d.agentNotifier.EXPECT().NotifyAgent(gomock.Any(), qaAgentID, gomock.Any()).Return(nil)
-	d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskAssigned)).Return(nil)
-	// FreedRole sweep for "coder" (leaving in_progress)
-	var wg sync.WaitGroup
-	wg.Add(1)
-	d.locker.EXPECT().WithLock(gomock.Any(), gomock.Any(), gomock.Any()).
-		DoAndReturn(func(ctx context.Context, key int64, fn func(context.Context) error) error {
-			defer wg.Done()
-			return fn(ctx)
+			got, err := svc.List(context.Background(), domaintask.ListFilters{})
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Len(t, got, tt.wantLen)
 		})
-	d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).Return([]domaintask.Task{}, nil).AnyTimes()
-
-	err := svc.UpdateStatus(context.Background(), task.ID, domaintask.StatusInProgress, domaintask.StatusInQA)
-	wg.Wait()
-	require.NoError(t, err)
+	}
 }
 
-func TestUpdateStatus_PipelineAssignRole_NoAgent(t *testing.T) {
-	// Graceful: no agent available — no assign, no notify, no error.
-	svc, d := newTaskSvc(t, pipeline.DefaultConfig)
-	task := newTask(domaintask.StatusInProgress)
+// ── UpdateStatus ──────────────────────────────────────────────────────────────
 
-	d.taskRepo.EXPECT().UpdateStatus(gomock.Any(), task.ID, domaintask.StatusInProgress, domaintask.StatusInQA).Return(nil)
-	d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskUpdated)).Return(nil)
-	d.taskRepo.EXPECT().GetByID(gomock.Any(), task.ID).Return(task, nil)
-	d.dist.EXPECT().Distribute(gomock.Any(), task.ProjectID, "qa").Return(uuid.Nil, distributor.ErrNoAgentAvailable)
-	// Sweep for freed coder role.
-	var wg sync.WaitGroup
-	wg.Add(1)
-	d.locker.EXPECT().WithLock(gomock.Any(), gomock.Any(), gomock.Any()).
-		DoAndReturn(func(ctx context.Context, key int64, fn func(context.Context) error) error {
-			defer wg.Done()
-			return fn(ctx)
+// setupUpdateStatus is a function that configures mock expectations for a single
+// UpdateStatus test case. It receives the deps, the pre-created taskID, and a
+// WaitGroup; it calls wg.Add(1) whenever it registers a sweep locker expectation
+// so the caller can wg.Wait() after invoking the service method.
+type setupUpdateStatus func(d svcDeps, taskID uuid.UUID, wg *sync.WaitGroup)
+
+func TestUpdateStatus(t *testing.T) {
+	tests := []struct {
+		name    string
+		from    domaintask.Status
+		to      domaintask.Status
+		cfg     pipeline.Config
+		setup   setupUpdateStatus
+		wantErr bool
+		wantMsg string
+	}{
+		{
+			name:    "invalid transition rejected before any repo call",
+			from:    domaintask.StatusMerged,
+			to:      domaintask.StatusInProgress,
+			cfg:     pipeline.DefaultConfig,
+			setup:   func(d svcDeps, _ uuid.UUID, _ *sync.WaitGroup) {},
+			wantErr: true,
+			wantMsg: "invalid transition",
+		},
+		{
+			name: "repo UpdateStatus error",
+			from: domaintask.StatusBacklog,
+			to:   domaintask.StatusReady,
+			cfg:  pipeline.DefaultConfig,
+			setup: func(d svcDeps, taskID uuid.UUID, _ *sync.WaitGroup) {
+				d.taskRepo.EXPECT().UpdateStatus(gomock.Any(), taskID, domaintask.StatusBacklog, domaintask.StatusReady).
+					Return(errors.New("db error"))
+			},
+			wantErr: true,
+		},
+		{
+			name: "GetByID fails after status update",
+			from: domaintask.StatusBacklog,
+			to:   domaintask.StatusReady,
+			cfg:  pipeline.DefaultConfig,
+			setup: func(d svcDeps, taskID uuid.UUID, _ *sync.WaitGroup) {
+				d.taskRepo.EXPECT().UpdateStatus(gomock.Any(), taskID, domaintask.StatusBacklog, domaintask.StatusReady).Return(nil)
+				d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskUpdated)).Return(nil)
+				d.taskRepo.EXPECT().GetByID(gomock.Any(), taskID).Return(domaintask.Task{}, errors.New("db error"))
+			},
+			wantErr: true,
+			wantMsg: "fetch task after status update",
+		},
+		{
+			name: "no pipeline action for target status",
+			from: domaintask.StatusBacklog,
+			to:   domaintask.StatusReady,
+			cfg:  pipeline.Config{}, // empty config → no action
+			setup: func(d svcDeps, taskID uuid.UUID, _ *sync.WaitGroup) {
+				task := domaintask.Task{ID: taskID, ProjectID: uuid.New(), Labels: []string{}}
+				d.taskRepo.EXPECT().UpdateStatus(gomock.Any(), taskID, domaintask.StatusBacklog, domaintask.StatusReady).Return(nil)
+				d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskUpdated)).Return(nil)
+				d.taskRepo.EXPECT().GetByID(gomock.Any(), taskID).Return(task, nil)
+			},
+		},
+		{
+			name: "ready→backlog has no DefaultConfig entry for backlog",
+			from: domaintask.StatusReady,
+			to:   domaintask.StatusBacklog,
+			cfg:  pipeline.DefaultConfig,
+			setup: func(d svcDeps, taskID uuid.UUID, _ *sync.WaitGroup) {
+				task := domaintask.Task{ID: taskID, ProjectID: uuid.New(), Labels: []string{}}
+				d.taskRepo.EXPECT().UpdateStatus(gomock.Any(), taskID, domaintask.StatusReady, domaintask.StatusBacklog).Return(nil)
+				d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskUpdated)).Return(nil)
+				d.taskRepo.EXPECT().GetByID(gomock.Any(), taskID).Return(task, nil)
+			},
+		},
+		{
+			// in_progress→ready: forward assign for "coder" + sweep for freed "coder".
+			name: "in_progress→ready: forward assign + freed-coder sweep",
+			from: domaintask.StatusInProgress,
+			to:   domaintask.StatusReady,
+			cfg:  pipeline.DefaultConfig,
+			setup: func(d svcDeps, taskID uuid.UUID, wg *sync.WaitGroup) {
+				agentID := uuid.New()
+				projectID := uuid.New()
+				task := domaintask.Task{ID: taskID, ProjectID: projectID, Labels: []string{}}
+				d.taskRepo.EXPECT().UpdateStatus(gomock.Any(), taskID, domaintask.StatusInProgress, domaintask.StatusReady).Return(nil)
+				d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskUpdated)).Return(nil)
+				d.taskRepo.EXPECT().GetByID(gomock.Any(), taskID).Return(task, nil)
+				d.dist.EXPECT().Distribute(gomock.Any(), projectID, "coder").Return(agentID, nil)
+				d.taskRepo.EXPECT().Assign(gomock.Any(), taskID, agentID).Return(nil)
+				d.agentNotifier.EXPECT().NotifyAgent(gomock.Any(), agentID, gomock.Any()).Return(nil)
+				d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskAssigned)).Return(nil)
+				wg.Add(1)
+				sweepNoOp(d, wg)
+			},
+		},
+		{
+			// in_progress→in_qa: QA assigned + sweep for freed "coder".
+			name: "pipeline assigns qa — agent available, sweep fires for coder",
+			from: domaintask.StatusInProgress,
+			to:   domaintask.StatusInQA,
+			cfg:  pipeline.DefaultConfig,
+			setup: func(d svcDeps, taskID uuid.UUID, wg *sync.WaitGroup) {
+				task := newTask(domaintask.StatusInProgress)
+				task.ID = taskID
+				qaAgentID := uuid.New()
+				d.taskRepo.EXPECT().UpdateStatus(gomock.Any(), taskID, domaintask.StatusInProgress, domaintask.StatusInQA).Return(nil)
+				d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskUpdated)).Return(nil)
+				d.taskRepo.EXPECT().GetByID(gomock.Any(), taskID).Return(task, nil)
+				d.dist.EXPECT().Distribute(gomock.Any(), task.ProjectID, "qa").Return(qaAgentID, nil)
+				d.taskRepo.EXPECT().Assign(gomock.Any(), taskID, qaAgentID).Return(nil)
+				d.agentNotifier.EXPECT().NotifyAgent(gomock.Any(), qaAgentID, gomock.Any()).Return(nil)
+				d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskAssigned)).Return(nil)
+				wg.Add(1)
+				sweepNoOp(d, wg)
+			},
+		},
+		{
+			// No QA available: graceful no-op, no service error.
+			name: "pipeline assigns qa — no agent available",
+			from: domaintask.StatusInProgress,
+			to:   domaintask.StatusInQA,
+			cfg:  pipeline.DefaultConfig,
+			setup: func(d svcDeps, taskID uuid.UUID, wg *sync.WaitGroup) {
+				task := newTask(domaintask.StatusInProgress)
+				task.ID = taskID
+				d.taskRepo.EXPECT().UpdateStatus(gomock.Any(), taskID, domaintask.StatusInProgress, domaintask.StatusInQA).Return(nil)
+				d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskUpdated)).Return(nil)
+				d.taskRepo.EXPECT().GetByID(gomock.Any(), taskID).Return(task, nil)
+				d.dist.EXPECT().Distribute(gomock.Any(), task.ProjectID, "qa").Return(uuid.Nil, distributor.ErrNoAgentAvailable)
+				wg.Add(1)
+				sweepNoOp(d, wg)
+			},
+		},
+		{
+			// Unexpected distribute error: logged and ignored, no service error.
+			name: "pipeline assign — unexpected distributor error is non-fatal",
+			from: domaintask.StatusInProgress,
+			to:   domaintask.StatusInQA,
+			cfg:  pipeline.DefaultConfig,
+			setup: func(d svcDeps, taskID uuid.UUID, wg *sync.WaitGroup) {
+				task := newTask(domaintask.StatusInProgress)
+				task.ID = taskID
+				d.taskRepo.EXPECT().UpdateStatus(gomock.Any(), taskID, domaintask.StatusInProgress, domaintask.StatusInQA).Return(nil)
+				d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskUpdated)).Return(nil)
+				d.taskRepo.EXPECT().GetByID(gomock.Any(), taskID).Return(task, nil)
+				d.dist.EXPECT().Distribute(gomock.Any(), task.ProjectID, "qa").Return(uuid.Nil, errors.New("unexpected"))
+				wg.Add(1)
+				sweepNoOp(d, wg)
+			},
+		},
+		{
+			// in_qa→in_progress: original coder idle → AssignIfIdle succeeds.
+			name: "bounce-back from in_qa — original coder idle",
+			from: domaintask.StatusInQA,
+			to:   domaintask.StatusInProgress,
+			cfg:  pipeline.DefaultConfig,
+			setup: func(d svcDeps, taskID uuid.UUID, wg *sync.WaitGroup) {
+				coderID := uuid.New()
+				task := newTask(domaintask.StatusInQA)
+				task.ID = taskID
+				task.CoderID = &coderID
+				d.taskRepo.EXPECT().UpdateStatus(gomock.Any(), taskID, domaintask.StatusInQA, domaintask.StatusInProgress).Return(nil)
+				d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskUpdated)).Return(nil)
+				d.taskRepo.EXPECT().GetByID(gomock.Any(), taskID).Return(task, nil)
+				d.taskRepo.EXPECT().AssignIfIdle(gomock.Any(), taskID, coderID).Return(true, nil)
+				d.agentNotifier.EXPECT().NotifyAgent(gomock.Any(), coderID, gomock.Any()).Return(nil)
+				d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskAssigned)).Return(nil)
+				wg.Add(1)
+				sweepNoOp(d, wg)
+			},
+		},
+		{
+			// in_qa→in_progress: original coder busy → fallback Distribute.
+			name: "bounce-back from in_qa — original coder busy, fallback distribute",
+			from: domaintask.StatusInQA,
+			to:   domaintask.StatusInProgress,
+			cfg:  pipeline.DefaultConfig,
+			setup: func(d svcDeps, taskID uuid.UUID, wg *sync.WaitGroup) {
+				coderID := uuid.New()
+				newCoder := uuid.New()
+				task := newTask(domaintask.StatusInQA)
+				task.ID = taskID
+				task.CoderID = &coderID
+				d.taskRepo.EXPECT().UpdateStatus(gomock.Any(), taskID, domaintask.StatusInQA, domaintask.StatusInProgress).Return(nil)
+				d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskUpdated)).Return(nil)
+				d.taskRepo.EXPECT().GetByID(gomock.Any(), taskID).Return(task, nil)
+				d.taskRepo.EXPECT().AssignIfIdle(gomock.Any(), taskID, coderID).Return(false, nil)
+				d.dist.EXPECT().Distribute(gomock.Any(), task.ProjectID, "coder").Return(newCoder, nil)
+				d.taskRepo.EXPECT().Assign(gomock.Any(), taskID, newCoder).Return(nil)
+				d.agentNotifier.EXPECT().NotifyAgent(gomock.Any(), newCoder, gomock.Any()).Return(nil)
+				d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskAssigned)).Return(nil)
+				wg.Add(1)
+				sweepNoOp(d, wg)
+			},
+		},
+		{
+			// in_qa→in_progress: no CoderID → skip AssignIfIdle, go straight to Distribute.
+			name: "bounce-back from in_qa — no CoderID, distribute directly",
+			from: domaintask.StatusInQA,
+			to:   domaintask.StatusInProgress,
+			cfg:  pipeline.DefaultConfig,
+			setup: func(d svcDeps, taskID uuid.UUID, wg *sync.WaitGroup) {
+				agentID := uuid.New()
+				task := newTask(domaintask.StatusInQA)
+				task.ID = taskID
+				// task.CoderID is nil
+				d.taskRepo.EXPECT().UpdateStatus(gomock.Any(), taskID, domaintask.StatusInQA, domaintask.StatusInProgress).Return(nil)
+				d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskUpdated)).Return(nil)
+				d.taskRepo.EXPECT().GetByID(gomock.Any(), taskID).Return(task, nil)
+				d.dist.EXPECT().Distribute(gomock.Any(), task.ProjectID, "coder").Return(agentID, nil)
+				d.taskRepo.EXPECT().Assign(gomock.Any(), taskID, agentID).Return(nil)
+				d.agentNotifier.EXPECT().NotifyAgent(gomock.Any(), agentID, gomock.Any()).Return(nil)
+				d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskAssigned)).Return(nil)
+				wg.Add(1)
+				sweepNoOp(d, wg)
+			},
+		},
+		{
+			// in_review→in_progress: same bounce-back path as in_qa→in_progress.
+			name: "bounce-back from in_review — original coder idle",
+			from: domaintask.StatusInReview,
+			to:   domaintask.StatusInProgress,
+			cfg:  pipeline.DefaultConfig,
+			setup: func(d svcDeps, taskID uuid.UUID, wg *sync.WaitGroup) {
+				coderID := uuid.New()
+				task := newTask(domaintask.StatusInReview)
+				task.ID = taskID
+				task.CoderID = &coderID
+				d.taskRepo.EXPECT().UpdateStatus(gomock.Any(), taskID, domaintask.StatusInReview, domaintask.StatusInProgress).Return(nil)
+				d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskUpdated)).Return(nil)
+				d.taskRepo.EXPECT().GetByID(gomock.Any(), taskID).Return(task, nil)
+				d.taskRepo.EXPECT().AssignIfIdle(gomock.Any(), taskID, coderID).Return(true, nil)
+				d.agentNotifier.EXPECT().NotifyAgent(gomock.Any(), coderID, gomock.Any()).Return(nil)
+				d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskAssigned)).Return(nil)
+				wg.Add(1)
+				sweepNoOp(d, wg)
+			},
+		},
+		{
+			name: "bounce-back AssignIfIdle repo error",
+			from: domaintask.StatusInQA,
+			to:   domaintask.StatusInProgress,
+			cfg:  pipeline.DefaultConfig,
+			setup: func(d svcDeps, taskID uuid.UUID, _ *sync.WaitGroup) {
+				coderID := uuid.New()
+				task := newTask(domaintask.StatusInQA)
+				task.ID = taskID
+				task.CoderID = &coderID
+				d.taskRepo.EXPECT().UpdateStatus(gomock.Any(), taskID, domaintask.StatusInQA, domaintask.StatusInProgress).Return(nil)
+				d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskUpdated)).Return(nil)
+				d.taskRepo.EXPECT().GetByID(gomock.Any(), taskID).Return(task, nil)
+				d.taskRepo.EXPECT().AssignIfIdle(gomock.Any(), taskID, coderID).Return(false, errors.New("db error"))
+			},
+			wantErr: true,
+			wantMsg: "bounce-back preferred assign",
+		},
+		{
+			name: "bounce-back fallback assign repo error",
+			from: domaintask.StatusInQA,
+			to:   domaintask.StatusInProgress,
+			cfg:  pipeline.DefaultConfig,
+			setup: func(d svcDeps, taskID uuid.UUID, _ *sync.WaitGroup) {
+				coderID := uuid.New()
+				newAgentID := uuid.New()
+				task := newTask(domaintask.StatusInQA)
+				task.ID = taskID
+				task.CoderID = &coderID
+				d.taskRepo.EXPECT().UpdateStatus(gomock.Any(), taskID, domaintask.StatusInQA, domaintask.StatusInProgress).Return(nil)
+				d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskUpdated)).Return(nil)
+				d.taskRepo.EXPECT().GetByID(gomock.Any(), taskID).Return(task, nil)
+				d.taskRepo.EXPECT().AssignIfIdle(gomock.Any(), taskID, coderID).Return(false, nil)
+				d.dist.EXPECT().Distribute(gomock.Any(), task.ProjectID, "coder").Return(newAgentID, nil)
+				d.taskRepo.EXPECT().Assign(gomock.Any(), taskID, newAgentID).Return(errors.New("db error"))
+			},
+			wantErr: true,
+		},
+		{
+			name: "in_review→merged: broadcast to coder role",
+			from: domaintask.StatusInReview,
+			to:   domaintask.StatusMerged,
+			cfg:  pipeline.DefaultConfig,
+			setup: func(d svcDeps, taskID uuid.UUID, wg *sync.WaitGroup) {
+				task := newTask(domaintask.StatusInReview)
+				task.ID = taskID
+				d.taskRepo.EXPECT().UpdateStatus(gomock.Any(), taskID, domaintask.StatusInReview, domaintask.StatusMerged).Return(nil)
+				d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskUpdated)).Return(nil)
+				d.taskRepo.EXPECT().GetByID(gomock.Any(), taskID).Return(task, nil)
+				d.roleNotifier.EXPECT().NotifyProjectRole(gomock.Any(), task.ProjectID, "coder", gomock.Any()).Return(nil)
+				d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskCompleted)).Return(nil)
+				wg.Add(1)
+				sweepNoOp(d, wg)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, d := newTaskSvc(t, tt.cfg)
+			taskID := uuid.New()
+			var wg sync.WaitGroup
+			tt.setup(d, taskID, &wg)
+
+			err := svc.UpdateStatus(context.Background(), taskID, tt.from, tt.to)
+			wg.Wait()
+
+			if tt.wantErr {
+				require.Error(t, err)
+				if tt.wantMsg != "" {
+					assert.Contains(t, err.Error(), tt.wantMsg)
+				}
+				return
+			}
+			require.NoError(t, err)
 		})
-	d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).Return([]domaintask.Task{}, nil).AnyTimes()
-
-	err := svc.UpdateStatus(context.Background(), task.ID, domaintask.StatusInProgress, domaintask.StatusInQA)
-	wg.Wait()
-	require.NoError(t, err)
-}
-
-func TestUpdateStatus_PipelineAssignRole_DistributeError(t *testing.T) {
-	// Unexpected distributor error: logged, task stays unassigned, no service error.
-	svc, d := newTaskSvc(t, pipeline.DefaultConfig)
-	task := newTask(domaintask.StatusInProgress)
-
-	d.taskRepo.EXPECT().UpdateStatus(gomock.Any(), task.ID, domaintask.StatusInProgress, domaintask.StatusInQA).Return(nil)
-	d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskUpdated)).Return(nil)
-	d.taskRepo.EXPECT().GetByID(gomock.Any(), task.ID).Return(task, nil)
-	d.dist.EXPECT().Distribute(gomock.Any(), task.ProjectID, "qa").Return(uuid.Nil, errors.New("unexpected"))
-	// Sweep for freed coder role.
-	var wg sync.WaitGroup
-	wg.Add(1)
-	d.locker.EXPECT().WithLock(gomock.Any(), gomock.Any(), gomock.Any()).
-		DoAndReturn(func(ctx context.Context, key int64, fn func(context.Context) error) error {
-			defer wg.Done()
-			return fn(ctx)
-		})
-	d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).Return([]domaintask.Task{}, nil).AnyTimes()
-
-	err := svc.UpdateStatus(context.Background(), task.ID, domaintask.StatusInProgress, domaintask.StatusInQA)
-	wg.Wait()
-	require.NoError(t, err)
-}
-
-// ── UpdateStatus — bounce-back routing ───────────────────────────────────────
-
-func TestUpdateStatus_BounceBack_OriginalCoderIdle(t *testing.T) {
-	svc, d := newTaskSvc(t, pipeline.DefaultConfig)
-	task := newTask(domaintask.StatusInQA)
-	coderID := uuid.New()
-	task.CoderID = &coderID
-
-	d.taskRepo.EXPECT().UpdateStatus(gomock.Any(), task.ID, domaintask.StatusInQA, domaintask.StatusInProgress).Return(nil)
-	d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskUpdated)).Return(nil)
-	d.taskRepo.EXPECT().GetByID(gomock.Any(), task.ID).Return(task, nil)
-	d.taskRepo.EXPECT().AssignIfIdle(gomock.Any(), task.ID, coderID).Return(true, nil)
-	// Notify original coder with "task_returned".
-	d.agentNotifier.EXPECT().NotifyAgent(gomock.Any(), coderID, gomock.Any()).Return(nil)
-	d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskAssigned)).Return(nil)
-	// Sweep for freed QA slot (from=InQA).
-	var wg sync.WaitGroup
-	wg.Add(1)
-	d.locker.EXPECT().WithLock(gomock.Any(), gomock.Any(), gomock.Any()).
-		DoAndReturn(func(ctx context.Context, key int64, fn func(context.Context) error) error {
-			defer wg.Done()
-			return fn(ctx)
-		})
-	d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).Return([]domaintask.Task{}, nil).AnyTimes()
-
-	err := svc.UpdateStatus(context.Background(), task.ID, domaintask.StatusInQA, domaintask.StatusInProgress)
-	wg.Wait()
-	require.NoError(t, err)
-}
-
-func TestUpdateStatus_BounceBack_OriginalCoderBusy(t *testing.T) {
-	svc, d := newTaskSvc(t, pipeline.DefaultConfig)
-	task := newTask(domaintask.StatusInQA)
-	coderID := uuid.New()
-	task.CoderID = &coderID
-	newCoder := uuid.New()
-
-	d.taskRepo.EXPECT().UpdateStatus(gomock.Any(), task.ID, domaintask.StatusInQA, domaintask.StatusInProgress).Return(nil)
-	d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskUpdated)).Return(nil)
-	d.taskRepo.EXPECT().GetByID(gomock.Any(), task.ID).Return(task, nil)
-	d.taskRepo.EXPECT().AssignIfIdle(gomock.Any(), task.ID, coderID).Return(false, nil) // coder busy
-	d.dist.EXPECT().Distribute(gomock.Any(), task.ProjectID, "coder").Return(newCoder, nil)
-	d.taskRepo.EXPECT().Assign(gomock.Any(), task.ID, newCoder).Return(nil)
-	d.agentNotifier.EXPECT().NotifyAgent(gomock.Any(), newCoder, gomock.Any()).Return(nil)
-	d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskAssigned)).Return(nil)
-	// Sweep for freed QA slot.
-	var wg sync.WaitGroup
-	wg.Add(1)
-	d.locker.EXPECT().WithLock(gomock.Any(), gomock.Any(), gomock.Any()).
-		DoAndReturn(func(ctx context.Context, key int64, fn func(context.Context) error) error {
-			defer wg.Done()
-			return fn(ctx)
-		})
-	d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).Return([]domaintask.Task{}, nil).AnyTimes()
-
-	err := svc.UpdateStatus(context.Background(), task.ID, domaintask.StatusInQA, domaintask.StatusInProgress)
-	wg.Wait()
-	require.NoError(t, err)
-}
-
-func TestUpdateStatus_BounceBack_NoCoderID(t *testing.T) {
-	svc, d := newTaskSvc(t, pipeline.DefaultConfig)
-	task := newTask(domaintask.StatusInQA)
-	// task.CoderID is nil
-	agentID := uuid.New()
-
-	d.taskRepo.EXPECT().UpdateStatus(gomock.Any(), task.ID, domaintask.StatusInQA, domaintask.StatusInProgress).Return(nil)
-	d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskUpdated)).Return(nil)
-	d.taskRepo.EXPECT().GetByID(gomock.Any(), task.ID).Return(task, nil)
-	// No CoderID: AssignIfIdle NOT called; Distribute called directly.
-	d.dist.EXPECT().Distribute(gomock.Any(), task.ProjectID, "coder").Return(agentID, nil)
-	d.taskRepo.EXPECT().Assign(gomock.Any(), task.ID, agentID).Return(nil)
-	d.agentNotifier.EXPECT().NotifyAgent(gomock.Any(), agentID, gomock.Any()).Return(nil)
-	d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskAssigned)).Return(nil)
-	// Sweep for freed QA slot.
-	var wg sync.WaitGroup
-	wg.Add(1)
-	d.locker.EXPECT().WithLock(gomock.Any(), gomock.Any(), gomock.Any()).
-		DoAndReturn(func(ctx context.Context, key int64, fn func(context.Context) error) error {
-			defer wg.Done()
-			return fn(ctx)
-		})
-	d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).Return([]domaintask.Task{}, nil).AnyTimes()
-
-	err := svc.UpdateStatus(context.Background(), task.ID, domaintask.StatusInQA, domaintask.StatusInProgress)
-	wg.Wait()
-	require.NoError(t, err)
-}
-
-func TestUpdateStatus_BounceBack_FromInReview_OriginalCoderIdle(t *testing.T) {
-	// Verifies in_review → in_progress uses the same bounce-back path as in_qa → in_progress.
-	svc, d := newTaskSvc(t, pipeline.DefaultConfig)
-	task := newTask(domaintask.StatusInReview)
-	coderID := uuid.New()
-	task.CoderID = &coderID
-
-	d.taskRepo.EXPECT().UpdateStatus(gomock.Any(), task.ID, domaintask.StatusInReview, domaintask.StatusInProgress).Return(nil)
-	d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskUpdated)).Return(nil)
-	d.taskRepo.EXPECT().GetByID(gomock.Any(), task.ID).Return(task, nil)
-	d.taskRepo.EXPECT().AssignIfIdle(gomock.Any(), task.ID, coderID).Return(true, nil)
-	d.agentNotifier.EXPECT().NotifyAgent(gomock.Any(), coderID, gomock.Any()).Return(nil)
-	d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskAssigned)).Return(nil)
-	// Sweep for freed reviewer slot (from=InReview).
-	var wg sync.WaitGroup
-	wg.Add(1)
-	d.locker.EXPECT().WithLock(gomock.Any(), gomock.Any(), gomock.Any()).
-		DoAndReturn(func(ctx context.Context, key int64, fn func(context.Context) error) error {
-			defer wg.Done()
-			return fn(ctx)
-		})
-	d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).Return([]domaintask.Task{}, nil).AnyTimes()
-
-	err := svc.UpdateStatus(context.Background(), task.ID, domaintask.StatusInReview, domaintask.StatusInProgress)
-	wg.Wait()
-	require.NoError(t, err)
-}
-
-// ── UpdateStatus — merged broadcast ──────────────────────────────────────────
-
-func TestUpdateStatus_MergedBroadcast(t *testing.T) {
-	svc, d := newTaskSvc(t, pipeline.DefaultConfig)
-	task := newTask(domaintask.StatusInReview)
-
-	d.taskRepo.EXPECT().UpdateStatus(gomock.Any(), task.ID, domaintask.StatusInReview, domaintask.StatusMerged).Return(nil)
-	d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskUpdated)).Return(nil)
-	d.taskRepo.EXPECT().GetByID(gomock.Any(), task.ID).Return(task, nil)
-	d.roleNotifier.EXPECT().NotifyProjectRole(gomock.Any(), task.ProjectID, "coder", gomock.Any()).Return(nil)
-	d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskCompleted)).Return(nil)
-	// Sweep for freed reviewer slot (from=InReview).
-	var wg sync.WaitGroup
-	wg.Add(1)
-	d.locker.EXPECT().WithLock(gomock.Any(), gomock.Any(), gomock.Any()).
-		DoAndReturn(func(ctx context.Context, key int64, fn func(context.Context) error) error {
-			defer wg.Done()
-			return fn(ctx)
-		})
-	d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).Return([]domaintask.Task{}, nil).AnyTimes()
-
-	err := svc.UpdateStatus(context.Background(), task.ID, domaintask.StatusInReview, domaintask.StatusMerged)
-	wg.Wait()
-	require.NoError(t, err)
+	}
 }
 
 // ── SweepUnassigned ───────────────────────────────────────────────────────────
 
-func TestSweepUnassigned_OneTask_OneAgent(t *testing.T) {
-	svc, d := newTaskSvc(t, pipeline.DefaultConfig)
-	ctx := context.Background()
-	projectID := uuid.New()
-	task := newTask(domaintask.StatusInQA)
-	agentID := uuid.New()
+func TestSweepUnassigned(t *testing.T) {
+	tests := []struct {
+		name    string
+		role    string
+		setup   func(d svcDeps, projectID uuid.UUID)
+		wantErr bool
+	}{
+		{
+			name: "one task one agent — assigned and notified",
+			role: "qa",
+			setup: func(d svcDeps, projectID uuid.UUID) {
+				task := newTask(domaintask.StatusInQA)
+				agentID := uuid.New()
+				d.locker.EXPECT().WithLock(gomock.Any(), gomock.Any(), gomock.Any()).
+					DoAndReturn(func(ctx context.Context, _ int64, fn func(context.Context) error) error { return fn(ctx) })
+				d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).Return([]domaintask.Task{task}, nil)
+				d.dist.EXPECT().Distribute(gomock.Any(), projectID, "qa").Return(agentID, nil)
+				d.taskRepo.EXPECT().Assign(gomock.Any(), task.ID, agentID).Return(nil)
+				d.agentNotifier.EXPECT().NotifyAgent(gomock.Any(), agentID, gomock.Any()).Return(nil)
+				d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskAssigned)).Return(nil)
+			},
+		},
+		{
+			name: "no tasks — no-op",
+			role: "qa",
+			setup: func(d svcDeps, projectID uuid.UUID) {
+				d.locker.EXPECT().WithLock(gomock.Any(), gomock.Any(), gomock.Any()).
+					DoAndReturn(func(ctx context.Context, _ int64, fn func(context.Context) error) error { return fn(ctx) })
+				d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).Return([]domaintask.Task{}, nil).AnyTimes()
+			},
+		},
+		{
+			name: "no agents — no-op",
+			role: "qa",
+			setup: func(d svcDeps, projectID uuid.UUID) {
+				task := newTask(domaintask.StatusInQA)
+				d.locker.EXPECT().WithLock(gomock.Any(), gomock.Any(), gomock.Any()).
+					DoAndReturn(func(ctx context.Context, _ int64, fn func(context.Context) error) error { return fn(ctx) })
+				d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).Return([]domaintask.Task{task}, nil)
+				d.dist.EXPECT().Distribute(gomock.Any(), projectID, "qa").Return(uuid.Nil, distributor.ErrNoAgentAvailable)
+			},
+		},
+		{
+			name: "3 tasks 2 agents — third stays unassigned",
+			role: "qa",
+			setup: func(d svcDeps, projectID uuid.UUID) {
+				tasks := []domaintask.Task{newTask(domaintask.StatusInQA), newTask(domaintask.StatusInQA), newTask(domaintask.StatusInQA)}
+				agent1, agent2 := uuid.New(), uuid.New()
+				d.locker.EXPECT().WithLock(gomock.Any(), gomock.Any(), gomock.Any()).
+					DoAndReturn(func(ctx context.Context, _ int64, fn func(context.Context) error) error { return fn(ctx) })
+				d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).Return(tasks, nil)
+				gomock.InOrder(
+					d.dist.EXPECT().Distribute(gomock.Any(), projectID, "qa").Return(agent1, nil),
+					d.taskRepo.EXPECT().Assign(gomock.Any(), tasks[0].ID, agent1).Return(nil),
+					d.agentNotifier.EXPECT().NotifyAgent(gomock.Any(), agent1, gomock.Any()).Return(nil),
+					d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskAssigned)).Return(nil),
+					d.dist.EXPECT().Distribute(gomock.Any(), projectID, "qa").Return(agent2, nil),
+					d.taskRepo.EXPECT().Assign(gomock.Any(), tasks[1].ID, agent2).Return(nil),
+					d.agentNotifier.EXPECT().NotifyAgent(gomock.Any(), agent2, gomock.Any()).Return(nil),
+					d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskAssigned)).Return(nil),
+					d.dist.EXPECT().Distribute(gomock.Any(), projectID, "qa").Return(uuid.Nil, distributor.ErrNoAgentAvailable),
+				)
+			},
+		},
+		{
+			name: "agent runs dry mid-batch",
+			role: "qa",
+			setup: func(d svcDeps, projectID uuid.UUID) {
+				tasks := []domaintask.Task{newTask(domaintask.StatusInQA), newTask(domaintask.StatusInQA), newTask(domaintask.StatusInQA)}
+				agent1 := uuid.New()
+				d.locker.EXPECT().WithLock(gomock.Any(), gomock.Any(), gomock.Any()).
+					DoAndReturn(func(ctx context.Context, _ int64, fn func(context.Context) error) error { return fn(ctx) })
+				d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).Return(tasks, nil)
+				gomock.InOrder(
+					d.dist.EXPECT().Distribute(gomock.Any(), projectID, "qa").Return(agent1, nil),
+					d.taskRepo.EXPECT().Assign(gomock.Any(), tasks[0].ID, agent1).Return(nil),
+					d.agentNotifier.EXPECT().NotifyAgent(gomock.Any(), agent1, gomock.Any()).Return(nil),
+					d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskAssigned)).Return(nil),
+					d.dist.EXPECT().Distribute(gomock.Any(), projectID, "qa").Return(uuid.Nil, distributor.ErrNoAgentAvailable),
+				)
+			},
+		},
+		{
+			name: "locker error returned",
+			role: "qa",
+			setup: func(d svcDeps, projectID uuid.UUID) {
+				d.locker.EXPECT().WithLock(gomock.Any(), gomock.Any(), gomock.Any()).Return(errors.New("lock error"))
+			},
+			wantErr: true,
+		},
+		{
+			name: "list error returned",
+			role: "qa",
+			setup: func(d svcDeps, projectID uuid.UUID) {
+				d.locker.EXPECT().WithLock(gomock.Any(), gomock.Any(), gomock.Any()).
+					DoAndReturn(func(ctx context.Context, _ int64, fn func(context.Context) error) error { return fn(ctx) })
+				d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).Return(nil, errors.New("db error"))
+			},
+			wantErr: true,
+		},
+		{
+			name: "assign error returned",
+			role: "qa",
+			setup: func(d svcDeps, projectID uuid.UUID) {
+				task := newTask(domaintask.StatusInQA)
+				agentID := uuid.New()
+				d.locker.EXPECT().WithLock(gomock.Any(), gomock.Any(), gomock.Any()).
+					DoAndReturn(func(ctx context.Context, _ int64, fn func(context.Context) error) error { return fn(ctx) })
+				d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).Return([]domaintask.Task{task}, nil)
+				d.dist.EXPECT().Distribute(gomock.Any(), projectID, "qa").Return(agentID, nil)
+				d.taskRepo.EXPECT().Assign(gomock.Any(), task.ID, agentID).Return(errors.New("assign error"))
+			},
+			wantErr: true,
+		},
+		{
+			// Gap H: stranded in_progress task recovered when "coder" sweep runs.
+			name: "recovers stranded in_progress orphan (Gap H)",
+			role: "coder",
+			setup: func(d svcDeps, projectID uuid.UUID) {
+				task := newTask(domaintask.StatusInProgress)
+				coderID := uuid.New()
+				d.locker.EXPECT().WithLock(gomock.Any(), gomock.Any(), gomock.Any()).
+					DoAndReturn(func(ctx context.Context, _ int64, fn func(context.Context) error) error { return fn(ctx) })
+				d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).
+					DoAndReturn(func(_ context.Context, f domaintask.ListFilters) ([]domaintask.Task, error) {
+						if f.Status != nil && *f.Status == domaintask.StatusInProgress {
+							return []domaintask.Task{task}, nil
+						}
+						return []domaintask.Task{}, nil
+					}).AnyTimes()
+				d.dist.EXPECT().Distribute(gomock.Any(), projectID, "coder").Return(coderID, nil)
+				d.taskRepo.EXPECT().Assign(gomock.Any(), task.ID, coderID).Return(nil)
+				d.agentNotifier.EXPECT().NotifyAgent(gomock.Any(), coderID, gomock.Any()).Return(nil)
+				d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskAssigned)).Return(nil)
+			},
+		},
+		{
+			// No idle coders: stranded in_progress sweep is a no-op.
+			name: "stranded in_progress — no idle coder available",
+			role: "coder",
+			setup: func(d svcDeps, projectID uuid.UUID) {
+				task := newTask(domaintask.StatusInProgress)
+				d.locker.EXPECT().WithLock(gomock.Any(), gomock.Any(), gomock.Any()).
+					DoAndReturn(func(ctx context.Context, _ int64, fn func(context.Context) error) error { return fn(ctx) })
+				d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).
+					DoAndReturn(func(_ context.Context, f domaintask.ListFilters) ([]domaintask.Task, error) {
+						if f.Status != nil && *f.Status == domaintask.StatusInProgress {
+							return []domaintask.Task{task}, nil
+						}
+						return []domaintask.Task{}, nil
+					}).AnyTimes()
+				d.dist.EXPECT().Distribute(gomock.Any(), projectID, "coder").Return(uuid.Nil, distributor.ErrNoAgentAvailable)
+			},
+		},
+	}
 
-	d.locker.EXPECT().WithLock(gomock.Any(), gomock.Any(), gomock.Any()).
-		DoAndReturn(func(ctx context.Context, _ int64, fn func(context.Context) error) error {
-			return fn(ctx)
-		})
-	d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).Return([]domaintask.Task{task}, nil)
-	d.dist.EXPECT().Distribute(gomock.Any(), projectID, "qa").Return(agentID, nil)
-	d.taskRepo.EXPECT().Assign(gomock.Any(), task.ID, agentID).Return(nil)
-	d.agentNotifier.EXPECT().NotifyAgent(gomock.Any(), agentID, gomock.Any()).Return(nil)
-	d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskAssigned)).Return(nil)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, d := newTaskSvc(t, pipeline.DefaultConfig)
+			projectID := uuid.New()
+			tt.setup(d, projectID)
 
-	err := svc.SweepUnassigned(ctx, projectID, "qa")
-	require.NoError(t, err)
-}
-
-func TestSweepUnassigned_MultipleTasksMultipleAgents(t *testing.T) {
-	// 3 tasks, 2 agents: exactly 2 get assigned, third stays unassigned.
-	svc, d := newTaskSvc(t, pipeline.DefaultConfig)
-	ctx := context.Background()
-	projectID := uuid.New()
-	tasks := []domaintask.Task{newTask(domaintask.StatusInQA), newTask(domaintask.StatusInQA), newTask(domaintask.StatusInQA)}
-	agent1, agent2 := uuid.New(), uuid.New()
-
-	d.locker.EXPECT().WithLock(gomock.Any(), gomock.Any(), gomock.Any()).
-		DoAndReturn(func(ctx context.Context, _ int64, fn func(context.Context) error) error {
-			return fn(ctx)
-		})
-	d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).Return(tasks, nil)
-	gomock.InOrder(
-		d.dist.EXPECT().Distribute(gomock.Any(), projectID, "qa").Return(agent1, nil),
-		d.taskRepo.EXPECT().Assign(gomock.Any(), tasks[0].ID, agent1).Return(nil),
-		d.agentNotifier.EXPECT().NotifyAgent(gomock.Any(), agent1, gomock.Any()).Return(nil),
-		d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskAssigned)).Return(nil),
-		d.dist.EXPECT().Distribute(gomock.Any(), projectID, "qa").Return(agent2, nil),
-		d.taskRepo.EXPECT().Assign(gomock.Any(), tasks[1].ID, agent2).Return(nil),
-		d.agentNotifier.EXPECT().NotifyAgent(gomock.Any(), agent2, gomock.Any()).Return(nil),
-		d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskAssigned)).Return(nil),
-		d.dist.EXPECT().Distribute(gomock.Any(), projectID, "qa").Return(uuid.Nil, distributor.ErrNoAgentAvailable),
-	)
-
-	err := svc.SweepUnassigned(ctx, projectID, "qa")
-	require.NoError(t, err)
-}
-
-func TestSweepUnassigned_NoTasks(t *testing.T) {
-	svc, d := newTaskSvc(t, pipeline.DefaultConfig)
-	ctx := context.Background()
-	projectID := uuid.New()
-
-	d.locker.EXPECT().WithLock(gomock.Any(), gomock.Any(), gomock.Any()).
-		DoAndReturn(func(ctx context.Context, _ int64, fn func(context.Context) error) error {
-			return fn(ctx)
-		})
-	d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).Return([]domaintask.Task{}, nil).AnyTimes()
-
-	err := svc.SweepUnassigned(ctx, projectID, "qa")
-	require.NoError(t, err)
-}
-
-func TestSweepUnassigned_NoAgents(t *testing.T) {
-	svc, d := newTaskSvc(t, pipeline.DefaultConfig)
-	ctx := context.Background()
-	projectID := uuid.New()
-	task := newTask(domaintask.StatusInQA)
-
-	d.locker.EXPECT().WithLock(gomock.Any(), gomock.Any(), gomock.Any()).
-		DoAndReturn(func(ctx context.Context, _ int64, fn func(context.Context) error) error {
-			return fn(ctx)
-		})
-	d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).Return([]domaintask.Task{task}, nil)
-	d.dist.EXPECT().Distribute(gomock.Any(), projectID, "qa").Return(uuid.Nil, distributor.ErrNoAgentAvailable)
-
-	err := svc.SweepUnassigned(ctx, projectID, "qa")
-	require.NoError(t, err)
-}
-
-func TestSweepUnassigned_AgentRunsDry_MidBatch(t *testing.T) {
-	svc, d := newTaskSvc(t, pipeline.DefaultConfig)
-	ctx := context.Background()
-	projectID := uuid.New()
-	tasks := []domaintask.Task{newTask(domaintask.StatusInQA), newTask(domaintask.StatusInQA), newTask(domaintask.StatusInQA)}
-	agent1 := uuid.New()
-
-	d.locker.EXPECT().WithLock(gomock.Any(), gomock.Any(), gomock.Any()).
-		DoAndReturn(func(ctx context.Context, _ int64, fn func(context.Context) error) error {
-			return fn(ctx)
-		})
-	d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).Return(tasks, nil)
-	gomock.InOrder(
-		d.dist.EXPECT().Distribute(gomock.Any(), projectID, "qa").Return(agent1, nil),
-		d.taskRepo.EXPECT().Assign(gomock.Any(), tasks[0].ID, agent1).Return(nil),
-		d.agentNotifier.EXPECT().NotifyAgent(gomock.Any(), agent1, gomock.Any()).Return(nil),
-		d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskAssigned)).Return(nil),
-		d.dist.EXPECT().Distribute(gomock.Any(), projectID, "qa").Return(uuid.Nil, distributor.ErrNoAgentAvailable),
-	)
-
-	err := svc.SweepUnassigned(ctx, projectID, "qa")
-	require.NoError(t, err)
-}
-
-func TestSweepUnassigned_LockerError(t *testing.T) {
-	svc, d := newTaskSvc(t, pipeline.DefaultConfig)
-	ctx := context.Background()
-
-	d.locker.EXPECT().WithLock(gomock.Any(), gomock.Any(), gomock.Any()).
-		Return(errors.New("lock error"))
-
-	err := svc.SweepUnassigned(ctx, uuid.New(), "qa")
-	require.Error(t, err)
-}
-
-func TestSweepUnassigned_ListError(t *testing.T) {
-	svc, d := newTaskSvc(t, pipeline.DefaultConfig)
-	ctx := context.Background()
-
-	d.locker.EXPECT().WithLock(gomock.Any(), gomock.Any(), gomock.Any()).
-		DoAndReturn(func(ctx context.Context, _ int64, fn func(context.Context) error) error {
-			return fn(ctx)
-		})
-	d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).Return(nil, errors.New("db error"))
-
-	err := svc.SweepUnassigned(ctx, uuid.New(), "qa")
-	require.Error(t, err)
-}
-
-func TestSweepUnassigned_AssignError(t *testing.T) {
-	svc, d := newTaskSvc(t, pipeline.DefaultConfig)
-	ctx := context.Background()
-	projectID := uuid.New()
-	task := newTask(domaintask.StatusInQA)
-	agentID := uuid.New()
-
-	d.locker.EXPECT().WithLock(gomock.Any(), gomock.Any(), gomock.Any()).
-		DoAndReturn(func(ctx context.Context, _ int64, fn func(context.Context) error) error {
-			return fn(ctx)
-		})
-	d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).Return([]domaintask.Task{task}, nil)
-	d.dist.EXPECT().Distribute(gomock.Any(), projectID, "qa").Return(agentID, nil)
-	d.taskRepo.EXPECT().Assign(gomock.Any(), task.ID, agentID).Return(errors.New("assign error"))
-
-	err := svc.SweepUnassigned(ctx, projectID, "qa")
-	require.Error(t, err)
-}
-
-// ── SweepUnassigned — Gap H (in_progress orphan recovery) ────────────────────
-
-func TestSweepUnassigned_RecoversBouncebackOrphan(t *testing.T) {
-	// pipelineConfig[in_progress].FreedRole="coder" — stranded in_progress task is swept.
-	svc, d := newTaskSvc(t, pipeline.DefaultConfig)
-	ctx := context.Background()
-	projectID := uuid.New()
-	task := newTask(domaintask.StatusInProgress)
-	coderID := uuid.New()
-
-	d.locker.EXPECT().WithLock(gomock.Any(), gomock.Any(), gomock.Any()).
-		DoAndReturn(func(ctx context.Context, _ int64, fn func(context.Context) error) error {
-			return fn(ctx)
-		})
-	// List may be called for multiple statuses matching "coder"; return task for in_progress.
-	d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).
-		DoAndReturn(func(_ context.Context, f domaintask.ListFilters) ([]domaintask.Task, error) {
-			if f.Status != nil && *f.Status == domaintask.StatusInProgress {
-				return []domaintask.Task{task}, nil
+			err := svc.SweepUnassigned(context.Background(), projectID, tt.role)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
 			}
-			return []domaintask.Task{}, nil
-		}).AnyTimes()
-	d.dist.EXPECT().Distribute(gomock.Any(), projectID, "coder").Return(coderID, nil)
-	d.taskRepo.EXPECT().Assign(gomock.Any(), task.ID, coderID).Return(nil)
-	d.agentNotifier.EXPECT().NotifyAgent(gomock.Any(), coderID, gomock.Any()).Return(nil)
-	d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskAssigned)).Return(nil)
-
-	err := svc.SweepUnassigned(ctx, projectID, "coder")
-	require.NoError(t, err)
-}
-
-func TestSweepUnassigned_InProgressOrphan_NoAgent(t *testing.T) {
-	// No idle coders: sweep is no-op, returns nil.
-	svc, d := newTaskSvc(t, pipeline.DefaultConfig)
-	ctx := context.Background()
-	projectID := uuid.New()
-	task := newTask(domaintask.StatusInProgress)
-
-	d.locker.EXPECT().WithLock(gomock.Any(), gomock.Any(), gomock.Any()).
-		DoAndReturn(func(ctx context.Context, _ int64, fn func(context.Context) error) error {
-			return fn(ctx)
+			require.NoError(t, err)
 		})
-	d.taskRepo.EXPECT().List(gomock.Any(), gomock.Any()).
-		DoAndReturn(func(_ context.Context, f domaintask.ListFilters) ([]domaintask.Task, error) {
-			if f.Status != nil && *f.Status == domaintask.StatusInProgress {
-				return []domaintask.Task{task}, nil
+	}
+}
+
+// ── SetPRUrl ──────────────────────────────────────────────────────────────────
+
+func TestSetPRUrl(t *testing.T) {
+	tests := []struct {
+		name    string
+		setup   func(d svcDeps, taskID uuid.UUID)
+		wantErr bool
+	}{
+		{
+			name: "success",
+			setup: func(d svcDeps, taskID uuid.UUID) {
+				d.taskRepo.EXPECT().SetPRUrl(gomock.Any(), taskID, "https://gh.com/pr/1").Return(nil)
+				d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskUpdated)).Return(nil)
+			},
+		},
+		{
+			name: "repo error",
+			setup: func(d svcDeps, taskID uuid.UUID) {
+				d.taskRepo.EXPECT().SetPRUrl(gomock.Any(), taskID, gomock.Any()).Return(errors.New("db error"))
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, d := newTaskSvc(t, pipeline.DefaultConfig)
+			taskID := uuid.New()
+			tt.setup(d, taskID)
+
+			err := svc.SetPRUrl(context.Background(), taskID, "https://gh.com/pr/1")
+			if tt.wantErr {
+				require.Error(t, err)
+				return
 			}
-			return []domaintask.Task{}, nil
-		}).AnyTimes()
-	d.dist.EXPECT().Distribute(gomock.Any(), projectID, "coder").Return(uuid.Nil, distributor.ErrNoAgentAvailable)
-
-	err := svc.SweepUnassigned(ctx, projectID, "coder")
-	require.NoError(t, err)
+			require.NoError(t, err)
+		})
+	}
 }
 
-// ── Dependency helpers ────────────────────────────────────────────────────────
+// ── AddDependency ─────────────────────────────────────────────────────────────
 
-func TestSetPRUrl_Success(t *testing.T) {
-	svc, d := newTaskSvc(t, pipeline.DefaultConfig)
-	taskID := uuid.New()
-	d.taskRepo.EXPECT().SetPRUrl(gomock.Any(), taskID, "https://gh.com/pr/1").Return(nil)
-	d.bus.EXPECT().Publish(gomock.Any(), matchEventType(event.TypeTaskUpdated)).Return(nil)
+func TestAddDependency(t *testing.T) {
+	tests := []struct {
+		name    string
+		setup   func(d svcDeps, taskID, depID uuid.UUID)
+		wantErr bool
+	}{
+		{
+			name: "success",
+			setup: func(d svcDeps, taskID, depID uuid.UUID) {
+				d.taskRepo.EXPECT().AddDependency(gomock.Any(), domaintask.Dependency{TaskID: taskID, DependsOnID: depID}).Return(nil)
+			},
+		},
+		{
+			name: "repo error",
+			setup: func(d svcDeps, taskID, depID uuid.UUID) {
+				d.taskRepo.EXPECT().AddDependency(gomock.Any(), gomock.Any()).Return(errors.New("db error"))
+			},
+			wantErr: true,
+		},
+	}
 
-	err := svc.SetPRUrl(context.Background(), taskID, "https://gh.com/pr/1")
-	require.NoError(t, err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, d := newTaskSvc(t, pipeline.DefaultConfig)
+			taskID, depID := uuid.New(), uuid.New()
+			tt.setup(d, taskID, depID)
+
+			err := svc.AddDependency(context.Background(), taskID, depID)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
 }
 
-func TestSetPRUrl_Error(t *testing.T) {
-	svc, d := newTaskSvc(t, pipeline.DefaultConfig)
-	taskID := uuid.New()
-	d.taskRepo.EXPECT().SetPRUrl(gomock.Any(), taskID, gomock.Any()).Return(errors.New("db error"))
+// ── RemoveDependency ──────────────────────────────────────────────────────────
 
-	err := svc.SetPRUrl(context.Background(), taskID, "https://gh.com/pr/1")
-	require.Error(t, err)
+func TestRemoveDependency(t *testing.T) {
+	tests := []struct {
+		name    string
+		setup   func(d svcDeps, taskID, depID uuid.UUID)
+		wantErr bool
+	}{
+		{
+			name: "success",
+			setup: func(d svcDeps, taskID, depID uuid.UUID) {
+				d.taskRepo.EXPECT().RemoveDependency(gomock.Any(), taskID, depID).Return(nil)
+			},
+		},
+		{
+			name: "repo error",
+			setup: func(d svcDeps, taskID, depID uuid.UUID) {
+				d.taskRepo.EXPECT().RemoveDependency(gomock.Any(), gomock.Any(), gomock.Any()).Return(errors.New("db error"))
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, d := newTaskSvc(t, pipeline.DefaultConfig)
+			taskID, depID := uuid.New(), uuid.New()
+			tt.setup(d, taskID, depID)
+
+			err := svc.RemoveDependency(context.Background(), taskID, depID)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
 }
 
-func TestAddDependency_Success(t *testing.T) {
-	svc, d := newTaskSvc(t, pipeline.DefaultConfig)
-	taskID, depID := uuid.New(), uuid.New()
-	d.taskRepo.EXPECT().AddDependency(gomock.Any(), domaintask.Dependency{TaskID: taskID, DependsOnID: depID}).Return(nil)
+// ── GetDependencies ───────────────────────────────────────────────────────────
 
-	err := svc.AddDependency(context.Background(), taskID, depID)
-	require.NoError(t, err)
-}
+func TestGetDependencies(t *testing.T) {
+	tests := []struct {
+		name    string
+		setup   func(d svcDeps, taskID uuid.UUID)
+		wantLen int
+		wantErr bool
+	}{
+		{
+			name: "success",
+			setup: func(d svcDeps, taskID uuid.UUID) {
+				deps := []domaintask.Task{newTask(domaintask.StatusMerged)}
+				d.taskRepo.EXPECT().GetDependencies(gomock.Any(), taskID).Return(deps, nil)
+			},
+			wantLen: 1,
+		},
+		{
+			name: "repo error",
+			setup: func(d svcDeps, taskID uuid.UUID) {
+				d.taskRepo.EXPECT().GetDependencies(gomock.Any(), gomock.Any()).Return(nil, errors.New("db error"))
+			},
+			wantErr: true,
+		},
+	}
 
-func TestAddDependency_Error(t *testing.T) {
-	svc, d := newTaskSvc(t, pipeline.DefaultConfig)
-	d.taskRepo.EXPECT().AddDependency(gomock.Any(), gomock.Any()).Return(errors.New("db error"))
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, d := newTaskSvc(t, pipeline.DefaultConfig)
+			taskID := uuid.New()
+			tt.setup(d, taskID)
 
-	err := svc.AddDependency(context.Background(), uuid.New(), uuid.New())
-	require.Error(t, err)
-}
-
-func TestRemoveDependency_Success(t *testing.T) {
-	svc, d := newTaskSvc(t, pipeline.DefaultConfig)
-	taskID, depID := uuid.New(), uuid.New()
-	d.taskRepo.EXPECT().RemoveDependency(gomock.Any(), taskID, depID).Return(nil)
-
-	err := svc.RemoveDependency(context.Background(), taskID, depID)
-	require.NoError(t, err)
-}
-
-func TestRemoveDependency_Error(t *testing.T) {
-	svc, d := newTaskSvc(t, pipeline.DefaultConfig)
-	d.taskRepo.EXPECT().RemoveDependency(gomock.Any(), gomock.Any(), gomock.Any()).Return(errors.New("db error"))
-
-	err := svc.RemoveDependency(context.Background(), uuid.New(), uuid.New())
-	require.Error(t, err)
-}
-
-func TestGetDependencies_Success(t *testing.T) {
-	svc, d := newTaskSvc(t, pipeline.DefaultConfig)
-	taskID := uuid.New()
-	deps := []domaintask.Task{newTask(domaintask.StatusMerged)}
-	d.taskRepo.EXPECT().GetDependencies(gomock.Any(), taskID).Return(deps, nil)
-
-	got, err := svc.GetDependencies(context.Background(), taskID)
-	require.NoError(t, err)
-	assert.Len(t, got, 1)
-}
-
-func TestGetDependencies_Error(t *testing.T) {
-	svc, d := newTaskSvc(t, pipeline.DefaultConfig)
-	d.taskRepo.EXPECT().GetDependencies(gomock.Any(), gomock.Any()).Return(nil, errors.New("db error"))
-
-	_, err := svc.GetDependencies(context.Background(), uuid.New())
-	require.Error(t, err)
+			got, err := svc.GetDependencies(context.Background(), taskID)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Len(t, got, tt.wantLen)
+		})
+	}
 }

@@ -19,9 +19,16 @@ import (
 	"github.com/alanyang/agent-mesh/internal/testutil"
 )
 
+// ── helpers ───────────────────────────────────────────────────────────────────
+
 func mkProject(t *testing.T, ctx context.Context, r *pgproject.Repository) domainproject.Project {
 	t.Helper()
-	p := domainproject.Project{ID: uuid.New(), Name: "th-" + uuid.New().String()[:6], RepoURL: "https://g", Config: map[string]interface{}{}}
+	p := domainproject.Project{
+		ID:      uuid.New(),
+		Name:    "th-" + uuid.New().String()[:6],
+		RepoURL: "https://g",
+		Config:  map[string]interface{}{},
+	}
 	c, err := r.Create(ctx, p)
 	require.NoError(t, err)
 	return c
@@ -35,6 +42,8 @@ func mkTask(t *testing.T, ctx context.Context, r *pgtask.Repository, projID uuid
 	require.NoError(t, err)
 	return c
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
 func TestThreadRepo_CreateGetList(t *testing.T) {
 	pool := testutil.SetupTestDB(t)
@@ -58,29 +67,30 @@ func TestThreadRepo_CreateGetList(t *testing.T) {
 	assert.Len(t, list, 1)
 }
 
-func TestThreadRepo_PostMessage_OrderIsStable(t *testing.T) {
-	pool := testutil.SetupTestDB(t)
-	ctx := context.Background()
-	projRepo := pgproject.New(pool)
-	threadRepo := pgthread.New(pool)
-	proj := mkProject(t, ctx, projRepo)
+func TestThreadRepo_PostMessage(t *testing.T) {
+	t.Run("insertion order is stable", func(t *testing.T) {
+		pool := testutil.SetupTestDB(t)
+		ctx := context.Background()
+		projRepo := pgproject.New(pool)
+		threadRepo := pgthread.New(pool)
+		proj := mkProject(t, ctx, projRepo)
 
-	thread := domainthread.New(proj.ID, domainthread.TypeTask, "t", nil)
-	_, err := threadRepo.CreateThread(ctx, thread)
-	require.NoError(t, err)
-
-	for i := 0; i < 3; i++ {
-		msg := domainthread.NewMessage(thread.ID, nil, domainthread.PostProgress, "msg")
-		_, err := threadRepo.CreateMessage(ctx, msg)
+		thread := domainthread.New(proj.ID, domainthread.TypeTask, "t", nil)
+		_, err := threadRepo.CreateThread(ctx, thread)
 		require.NoError(t, err)
-	}
 
-	msgs, err := threadRepo.ListMessages(ctx, thread.ID)
-	require.NoError(t, err)
-	require.Len(t, msgs, 3)
-	// Messages must be oldest first.
-	assert.True(t, !msgs[0].CreatedAt.After(msgs[1].CreatedAt), "messages must be in insertion order")
-	assert.True(t, !msgs[1].CreatedAt.After(msgs[2].CreatedAt))
+		for i := 0; i < 3; i++ {
+			msg := domainthread.NewMessage(thread.ID, nil, domainthread.PostProgress, "msg")
+			_, err := threadRepo.CreateMessage(ctx, msg)
+			require.NoError(t, err)
+		}
+
+		msgs, err := threadRepo.ListMessages(ctx, thread.ID)
+		require.NoError(t, err)
+		require.Len(t, msgs, 3)
+		assert.True(t, !msgs[0].CreatedAt.After(msgs[1].CreatedAt), "messages must be in insertion order")
+		assert.True(t, !msgs[1].CreatedAt.After(msgs[2].CreatedAt))
+	})
 }
 
 func TestThreadRepo_ThreadStillReadableAfterMerge(t *testing.T) {
@@ -107,34 +117,35 @@ func TestThreadRepo_ThreadStillReadableAfterMerge(t *testing.T) {
 	require.NoError(t, taskRepo.UpdateStatus(ctx, task.ID, domaintask.StatusInQA, domaintask.StatusInReview))
 	require.NoError(t, taskRepo.UpdateStatus(ctx, task.ID, domaintask.StatusInReview, domaintask.StatusMerged))
 
-	// Thread messages must still be readable after merge.
+	// Messages must still be readable after merge.
 	msgs, err := threadRepo.ListMessages(ctx, thread.ID)
 	require.NoError(t, err)
 	assert.Len(t, msgs, 1)
 	assert.Equal(t, "progress update", msgs[0].Content)
 }
 
-func TestThreadRepo_ListThreadsWithTaskFilter(t *testing.T) {
-	pool := testutil.SetupTestDB(t)
-	ctx := context.Background()
-	projRepo := pgproject.New(pool)
-	taskRepo := pgtask.New(pool)
-	threadRepo := pgthread.New(pool)
-	proj := mkProject(t, ctx, projRepo)
+func TestThreadRepo_ListThreads(t *testing.T) {
+	t.Run("task_id filter returns only matching thread", func(t *testing.T) {
+		pool := testutil.SetupTestDB(t)
+		ctx := context.Background()
+		projRepo := pgproject.New(pool)
+		taskRepo := pgtask.New(pool)
+		threadRepo := pgthread.New(pool)
+		proj := mkProject(t, ctx, projRepo)
 
-	task1 := mkTask(t, ctx, taskRepo, proj.ID)
-	task2 := mkTask(t, ctx, taskRepo, proj.ID)
+		task1 := mkTask(t, ctx, taskRepo, proj.ID)
+		task2 := mkTask(t, ctx, taskRepo, proj.ID)
 
-	thread1 := domainthread.New(proj.ID, domainthread.TypeTask, "t1", &task1.ID)
-	thread2 := domainthread.New(proj.ID, domainthread.TypeTask, "t2", &task2.ID)
-	_, err := threadRepo.CreateThread(ctx, thread1)
-	require.NoError(t, err)
-	_, err = threadRepo.CreateThread(ctx, thread2)
-	require.NoError(t, err)
+		thread1 := domainthread.New(proj.ID, domainthread.TypeTask, "t1", &task1.ID)
+		thread2 := domainthread.New(proj.ID, domainthread.TypeTask, "t2", &task2.ID)
+		_, err := threadRepo.CreateThread(ctx, thread1)
+		require.NoError(t, err)
+		_, err = threadRepo.CreateThread(ctx, thread2)
+		require.NoError(t, err)
 
-	// Filter by task1 — should return only thread1.
-	list, err := threadRepo.ListThreads(ctx, domainthread.ListFilters{TaskID: &task1.ID})
-	require.NoError(t, err)
-	require.Len(t, list, 1)
-	assert.Equal(t, thread1.ID, list[0].ID)
+		list, err := threadRepo.ListThreads(ctx, domainthread.ListFilters{TaskID: &task1.ID})
+		require.NoError(t, err)
+		require.Len(t, list, 1)
+		assert.Equal(t, thread1.ID, list[0].ID)
+	})
 }

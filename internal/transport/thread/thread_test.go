@@ -39,145 +39,200 @@ func newThreadSvc(t *testing.T) (*threadsvc.Service, *mocks.MockThreadRepository
 
 // ── POST / (createThread) ─────────────────────────────────────────────────────
 
-func TestCreateThread_Success(t *testing.T) {
-	svc, repo, _ := newThreadSvc(t)
-	r := newRouter(svc)
-	projectID := uuid.New()
+func TestCreateThread(t *testing.T) {
+	tests := []struct {
+		name     string
+		body     map[string]interface{}
+		setup    func(repo *mocks.MockThreadRepository)
+		wantCode int
+	}{
+		{
+			name: "success returns 201 with TypeTask",
+			body: map[string]interface{}{"project_id": uuid.New().String(), "name": "thread"},
+			setup: func(repo *mocks.MockThreadRepository) {
+				projectID := uuid.New()
+				created := domainthread.Thread{ID: uuid.New(), ProjectID: projectID, Type: domainthread.TypeTask, Name: "thread"}
+				repo.EXPECT().CreateThread(gomock.Any(), gomock.Any()).Return(created, nil)
+			},
+			wantCode: http.StatusCreated,
+		},
+		{
+			name:     "missing required fields returns 400",
+			body:     map[string]interface{}{},
+			setup:    func(repo *mocks.MockThreadRepository) {},
+			wantCode: http.StatusBadRequest,
+		},
+	}
 
-	created := domainthread.Thread{ID: uuid.New(), ProjectID: projectID, Type: domainthread.TypeTask, Name: "thread"}
-	repo.EXPECT().CreateThread(gomock.Any(), gomock.Any()).Return(created, nil)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, repo, _ := newThreadSvc(t)
+			tt.setup(repo)
+			r := newRouter(svc)
 
-	body, _ := json.Marshal(map[string]interface{}{"project_id": projectID.String(), "name": "thread"})
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, "/threads/", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	r.ServeHTTP(w, req)
+			body, _ := json.Marshal(tt.body)
+			w := httptest.NewRecorder()
+			req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, "/threads/", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			r.ServeHTTP(w, req)
 
-	assert.Equal(t, http.StatusCreated, w.Code)
-	var got domainthread.Thread
-	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
-	// Handler always passes TypeTask regardless of any type field in body.
-	assert.Equal(t, domainthread.TypeTask, got.Type)
+			assert.Equal(t, tt.wantCode, w.Code)
+			if tt.wantCode == http.StatusCreated {
+				var got domainthread.Thread
+				require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+				assert.Equal(t, domainthread.TypeTask, got.Type)
+			}
+		})
+	}
 }
 
-func TestCreateThread_BadBody(t *testing.T) {
-	svc, _, _ := newThreadSvc(t)
-	r := newRouter(svc)
+// ── GET / (listThreads) ───────────────────────────────────────────────────────
 
-	body, _ := json.Marshal(map[string]string{}) // missing required name/project_id
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, "/threads/", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	r.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusBadRequest, w.Code)
-}
+func TestListThreads(t *testing.T) {
+	tests := []struct {
+		name     string
+		query    string
+		setup    func(repo *mocks.MockThreadRepository)
+		wantCode int
+	}{
+		{
+			name: "success returns 200",
+			setup: func(repo *mocks.MockThreadRepository) {
+				repo.EXPECT().ListThreads(gomock.Any(), gomock.Any()).
+					Return([]domainthread.Thread{{ID: uuid.New()}}, nil)
+			},
+			wantCode: http.StatusOK,
+		},
+		{
+			name:     "invalid project_id returns 400",
+			query:    "?project_id=not-a-uuid",
+			setup:    func(repo *mocks.MockThreadRepository) {},
+			wantCode: http.StatusBadRequest,
+		},
+		{
+			name:     "invalid task_id returns 400",
+			query:    "?task_id=not-a-uuid",
+			setup:    func(repo *mocks.MockThreadRepository) {},
+			wantCode: http.StatusBadRequest,
+		},
+	}
 
-// ── GET / (listThreads) ────────────────────────────────────────────────────────
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, repo, _ := newThreadSvc(t)
+			tt.setup(repo)
+			r := newRouter(svc)
 
-func TestListThreads_Success(t *testing.T) {
-	svc, repo, _ := newThreadSvc(t)
-	r := newRouter(svc)
+			w := httptest.NewRecorder()
+			req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/threads/"+tt.query, nil)
+			r.ServeHTTP(w, req)
 
-	repo.EXPECT().ListThreads(gomock.Any(), gomock.Any()).Return([]domainthread.Thread{{ID: uuid.New()}}, nil)
-
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/threads/", nil)
-	r.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusOK, w.Code)
-}
-
-func TestListThreads_InvalidProjectID(t *testing.T) {
-	svc, _, _ := newThreadSvc(t)
-	r := newRouter(svc)
-
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/threads/?project_id=not-a-uuid", nil)
-	r.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusBadRequest, w.Code)
-}
-
-func TestListThreads_InvalidTaskID(t *testing.T) {
-	svc, _, _ := newThreadSvc(t)
-	r := newRouter(svc)
-
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/threads/?task_id=not-a-uuid", nil)
-	r.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusBadRequest, w.Code)
+			assert.Equal(t, tt.wantCode, w.Code)
+		})
+	}
 }
 
 // ── GET /:id/messages (listMessages) ─────────────────────────────────────────
 
-func TestListMessages_Success(t *testing.T) {
-	svc, repo, _ := newThreadSvc(t)
-	r := newRouter(svc)
-	threadID := uuid.New()
+func TestListMessages(t *testing.T) {
+	tests := []struct {
+		name     string
+		id       string
+		setup    func(repo *mocks.MockThreadRepository, threadID uuid.UUID)
+		wantCode int
+	}{
+		{
+			name: "success returns 200",
+			setup: func(repo *mocks.MockThreadRepository, threadID uuid.UUID) {
+				repo.EXPECT().ListMessages(gomock.Any(), threadID).
+					Return([]domainthread.Message{{ID: uuid.New()}}, nil)
+			},
+			wantCode: http.StatusOK,
+		},
+		{
+			name:     "invalid UUID returns 400",
+			id:       "not-a-uuid",
+			setup:    func(repo *mocks.MockThreadRepository, threadID uuid.UUID) {},
+			wantCode: http.StatusBadRequest,
+		},
+	}
 
-	repo.EXPECT().ListMessages(gomock.Any(), threadID).Return([]domainthread.Message{{ID: uuid.New()}}, nil)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, repo, _ := newThreadSvc(t)
+			threadID := uuid.New()
+			tt.setup(repo, threadID)
+			r := newRouter(svc)
 
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/threads/"+threadID.String()+"/messages", nil)
-	r.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusOK, w.Code)
-}
+			id := tt.id
+			if id == "" {
+				id = threadID.String()
+			}
 
-func TestListMessages_InvalidID(t *testing.T) {
-	svc, _, _ := newThreadSvc(t)
-	r := newRouter(svc)
+			w := httptest.NewRecorder()
+			req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/threads/"+id+"/messages", nil)
+			r.ServeHTTP(w, req)
 
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/threads/not-a-uuid/messages", nil)
-	r.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusBadRequest, w.Code)
+			assert.Equal(t, tt.wantCode, w.Code)
+		})
+	}
 }
 
 // ── POST /:id/messages (postMessage) ─────────────────────────────────────────
 
-func TestPostMessage_Success(t *testing.T) {
-	svc, repo, bus := newThreadSvc(t)
-	r := newRouter(svc)
-	threadID := uuid.New()
+func TestPostMessage(t *testing.T) {
+	tests := []struct {
+		name     string
+		body     map[string]string
+		setup    func(repo *mocks.MockThreadRepository, bus *mocks.MockEventBus, threadID uuid.UUID)
+		wantCode int
+	}{
+		{
+			name: "success returns 201",
+			body: map[string]string{"post_type": "progress", "content": "hello"},
+			setup: func(repo *mocks.MockThreadRepository, bus *mocks.MockEventBus, threadID uuid.UUID) {
+				expected := domainthread.Message{ID: uuid.New(), ThreadID: threadID, Content: "hello"}
+				repo.EXPECT().CreateMessage(gomock.Any(), gomock.Any()).Return(expected, nil)
+				bus.EXPECT().Publish(gomock.Any(), gomock.Any()).Return(nil)
+			},
+			wantCode: http.StatusCreated,
+		},
+		{
+			name:     "missing required fields returns 400",
+			body:     map[string]string{},
+			setup:    func(repo *mocks.MockThreadRepository, bus *mocks.MockEventBus, threadID uuid.UUID) {},
+			wantCode: http.StatusBadRequest,
+		},
+		{
+			name: "service error returns 500",
+			body: map[string]string{"post_type": "progress", "content": "hi"},
+			setup: func(repo *mocks.MockThreadRepository, bus *mocks.MockEventBus, threadID uuid.UUID) {
+				repo.EXPECT().CreateMessage(gomock.Any(), gomock.Any()).
+					Return(domainthread.Message{}, errors.New("db error"))
+			},
+			wantCode: http.StatusInternalServerError,
+		},
+	}
 
-	expected := domainthread.Message{ID: uuid.New(), ThreadID: threadID, Content: "hello"}
-	repo.EXPECT().CreateMessage(gomock.Any(), gomock.Any()).Return(expected, nil)
-	bus.EXPECT().Publish(gomock.Any(), gomock.Any()).Return(nil)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, repo, bus := newThreadSvc(t)
+			threadID := uuid.New()
+			tt.setup(repo, bus, threadID)
+			r := newRouter(svc)
 
-	body, _ := json.Marshal(map[string]string{"post_type": "progress", "content": "hello"})
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, "/threads/"+threadID.String()+"/messages", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	r.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusCreated, w.Code)
+			body, _ := json.Marshal(tt.body)
+			w := httptest.NewRecorder()
+			req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, "/threads/"+threadID.String()+"/messages", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			r.ServeHTTP(w, req)
 
-	var got domainthread.Message
-	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
-	assert.Equal(t, expected.ID, got.ID)
-}
-
-func TestPostMessage_BadBody(t *testing.T) {
-	svc, _, _ := newThreadSvc(t)
-	r := newRouter(svc)
-	threadID := uuid.New()
-
-	body, _ := json.Marshal(map[string]string{}) // missing required fields
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, "/threads/"+threadID.String()+"/messages", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	r.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusBadRequest, w.Code)
-}
-
-func TestPostMessage_ServiceError(t *testing.T) {
-	svc, repo, _ := newThreadSvc(t)
-	r := newRouter(svc)
-	threadID := uuid.New()
-
-	repo.EXPECT().CreateMessage(gomock.Any(), gomock.Any()).Return(domainthread.Message{}, errors.New("db error"))
-
-	body, _ := json.Marshal(map[string]string{"post_type": "progress", "content": "hi"})
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, "/threads/"+threadID.String()+"/messages", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	r.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusInternalServerError, w.Code)
+			assert.Equal(t, tt.wantCode, w.Code)
+			if tt.wantCode == http.StatusCreated {
+				var got domainthread.Message
+				require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+				assert.NotEqual(t, uuid.Nil, got.ID)
+			}
+		})
+	}
 }

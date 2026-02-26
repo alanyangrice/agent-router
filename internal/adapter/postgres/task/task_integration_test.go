@@ -19,9 +19,16 @@ import (
 	"github.com/alanyang/agent-mesh/internal/testutil"
 )
 
+// ── helpers ───────────────────────────────────────────────────────────────────
+
 func makeProject(t *testing.T, ctx context.Context, r *pgproject.Repository) domainproject.Project {
 	t.Helper()
-	p := domainproject.Project{ID: uuid.New(), Name: "t-" + uuid.New().String()[:6], RepoURL: "https://g.io", Config: map[string]interface{}{}}
+	p := domainproject.Project{
+		ID:      uuid.New(),
+		Name:    "t-" + uuid.New().String()[:6],
+		RepoURL: "https://g.io",
+		Config:  map[string]interface{}{},
+	}
 	created, err := r.Create(ctx, p)
 	require.NoError(t, err)
 	return created
@@ -74,6 +81,8 @@ func advanceTask(t *testing.T, ctx context.Context, r *pgtask.Repository, taskID
 	}
 }
 
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
 func TestTaskRepo_CreateGetList(t *testing.T) {
 	pool := testutil.SetupTestDB(t)
 	ctx := context.Background()
@@ -93,124 +102,133 @@ func TestTaskRepo_CreateGetList(t *testing.T) {
 	assert.Len(t, list, 1)
 }
 
-func TestTaskRepo_UpdateStatus_CAS(t *testing.T) {
-	pool := testutil.SetupTestDB(t)
-	ctx := context.Background()
-	projRepo := pgproject.New(pool)
-	taskRepo := pgtask.New(pool)
-	proj := makeProject(t, ctx, projRepo)
-	task := makeTask(t, ctx, taskRepo, proj.ID)
+func TestTaskRepo_UpdateStatus(t *testing.T) {
+	t.Run("CAS succeeds on correct from-status", func(t *testing.T) {
+		pool := testutil.SetupTestDB(t)
+		ctx := context.Background()
+		projRepo := pgproject.New(pool)
+		taskRepo := pgtask.New(pool)
+		proj := makeProject(t, ctx, projRepo)
+		task := makeTask(t, ctx, taskRepo, proj.ID)
 
-	// Valid CAS: backlog→ready succeeds.
-	err := taskRepo.UpdateStatus(ctx, task.ID, domaintask.StatusBacklog, domaintask.StatusReady)
-	require.NoError(t, err)
+		err := taskRepo.UpdateStatus(ctx, task.ID, domaintask.StatusBacklog, domaintask.StatusReady)
+		require.NoError(t, err)
+	})
 
-	// Wrong-from CAS: backlog→ready again must fail (status is now ready).
-	err = taskRepo.UpdateStatus(ctx, task.ID, domaintask.StatusBacklog, domaintask.StatusReady)
-	require.Error(t, err, "CAS must fail when current status does not match from")
+	t.Run("CAS fails when current status does not match from", func(t *testing.T) {
+		pool := testutil.SetupTestDB(t)
+		ctx := context.Background()
+		projRepo := pgproject.New(pool)
+		taskRepo := pgtask.New(pool)
+		proj := makeProject(t, ctx, projRepo)
+		task := makeTask(t, ctx, taskRepo, proj.ID)
+
+		require.NoError(t, taskRepo.UpdateStatus(ctx, task.ID, domaintask.StatusBacklog, domaintask.StatusReady))
+		// Now status is ready, so backlog→ready should fail.
+		err := taskRepo.UpdateStatus(ctx, task.ID, domaintask.StatusBacklog, domaintask.StatusReady)
+		require.Error(t, err, "CAS must fail when current status does not match from")
+	})
 }
 
-func TestTaskRepo_Assign_Unassign(t *testing.T) {
-	pool := testutil.SetupTestDB(t)
-	ctx := context.Background()
-	projRepo := pgproject.New(pool)
-	agentRepo := pgagent.New(pool)
-	taskRepo := pgtask.New(pool)
-	proj := makeProject(t, ctx, projRepo)
-	agent := makeAgent(t, ctx, agentRepo, proj.ID)
-	task := makeTask(t, ctx, taskRepo, proj.ID)
-	advanceTask(t, ctx, taskRepo, task.ID, domaintask.StatusReady)
+func TestTaskRepo_Assign(t *testing.T) {
+	t.Run("assign then unassign clears agent", func(t *testing.T) {
+		pool := testutil.SetupTestDB(t)
+		ctx := context.Background()
+		projRepo := pgproject.New(pool)
+		agentRepo := pgagent.New(pool)
+		taskRepo := pgtask.New(pool)
+		proj := makeProject(t, ctx, projRepo)
+		agent := makeAgent(t, ctx, agentRepo, proj.ID)
+		task := makeTask(t, ctx, taskRepo, proj.ID)
+		advanceTask(t, ctx, taskRepo, task.ID, domaintask.StatusReady)
 
-	require.NoError(t, taskRepo.Assign(ctx, task.ID, agent.ID))
-	got, _ := taskRepo.GetByID(ctx, task.ID)
-	require.NotNil(t, got.AssignedAgentID)
-	assert.Equal(t, agent.ID, *got.AssignedAgentID)
+		require.NoError(t, taskRepo.Assign(ctx, task.ID, agent.ID))
+		got, _ := taskRepo.GetByID(ctx, task.ID)
+		require.NotNil(t, got.AssignedAgentID)
+		assert.Equal(t, agent.ID, *got.AssignedAgentID)
 
-	require.NoError(t, taskRepo.Unassign(ctx, task.ID))
-	got, _ = taskRepo.GetByID(ctx, task.ID)
-	assert.Nil(t, got.AssignedAgentID)
-}
+		require.NoError(t, taskRepo.Unassign(ctx, task.ID))
+		got, _ = taskRepo.GetByID(ctx, task.ID)
+		assert.Nil(t, got.AssignedAgentID)
+	})
 
-func TestTaskRepo_UnassignByAgent_OnlyReady(t *testing.T) {
-	pool := testutil.SetupTestDB(t)
-	ctx := context.Background()
-	projRepo := pgproject.New(pool)
-	agentRepo := pgagent.New(pool)
-	taskRepo := pgtask.New(pool)
-	proj := makeProject(t, ctx, projRepo)
-	agent := makeAgent(t, ctx, agentRepo, proj.ID)
+	t.Run("UnassignByAgent only unassigns ready tasks (in_progress and in_qa preserved)", func(t *testing.T) {
+		pool := testutil.SetupTestDB(t)
+		ctx := context.Background()
+		projRepo := pgproject.New(pool)
+		agentRepo := pgagent.New(pool)
+		taskRepo := pgtask.New(pool)
+		proj := makeProject(t, ctx, projRepo)
+		agent := makeAgent(t, ctx, agentRepo, proj.ID)
 
-	readyTask := makeTask(t, ctx, taskRepo, proj.ID)
-	advanceTask(t, ctx, taskRepo, readyTask.ID, domaintask.StatusReady)
-	require.NoError(t, taskRepo.Assign(ctx, readyTask.ID, agent.ID))
+		readyTask := makeTask(t, ctx, taskRepo, proj.ID)
+		advanceTask(t, ctx, taskRepo, readyTask.ID, domaintask.StatusReady)
+		require.NoError(t, taskRepo.Assign(ctx, readyTask.ID, agent.ID))
 
-	inProgressTask := makeTask(t, ctx, taskRepo, proj.ID)
-	advanceTask(t, ctx, taskRepo, inProgressTask.ID, domaintask.StatusInProgress)
-	require.NoError(t, taskRepo.Assign(ctx, inProgressTask.ID, agent.ID))
+		inProgressTask := makeTask(t, ctx, taskRepo, proj.ID)
+		advanceTask(t, ctx, taskRepo, inProgressTask.ID, domaintask.StatusInProgress)
+		require.NoError(t, taskRepo.Assign(ctx, inProgressTask.ID, agent.ID))
 
-	inQATask := makeTask(t, ctx, taskRepo, proj.ID)
-	advanceTask(t, ctx, taskRepo, inQATask.ID, domaintask.StatusInQA)
-	require.NoError(t, taskRepo.Assign(ctx, inQATask.ID, agent.ID))
+		inQATask := makeTask(t, ctx, taskRepo, proj.ID)
+		advanceTask(t, ctx, taskRepo, inQATask.ID, domaintask.StatusInQA)
+		require.NoError(t, taskRepo.Assign(ctx, inQATask.ID, agent.ID))
 
-	// UnassignByAgent should only unassign the ready task.
-	require.NoError(t, taskRepo.UnassignByAgent(ctx, agent.ID))
+		require.NoError(t, taskRepo.UnassignByAgent(ctx, agent.ID))
 
-	ready, _ := taskRepo.GetByID(ctx, readyTask.ID)
-	assert.Nil(t, ready.AssignedAgentID, "ready task must be unassigned")
+		ready, _ := taskRepo.GetByID(ctx, readyTask.ID)
+		assert.Nil(t, ready.AssignedAgentID, "ready task must be unassigned")
 
-	inProgress, _ := taskRepo.GetByID(ctx, inProgressTask.ID)
-	assert.Equal(t, agent.ID, *inProgress.AssignedAgentID, "in_progress task must remain assigned (grace period)")
+		inProgress, _ := taskRepo.GetByID(ctx, inProgressTask.ID)
+		assert.Equal(t, agent.ID, *inProgress.AssignedAgentID, "in_progress must remain assigned (grace period)")
 
-	inQA, _ := taskRepo.GetByID(ctx, inQATask.ID)
-	assert.Equal(t, agent.ID, *inQA.AssignedAgentID, "in_qa task must remain assigned (grace period)")
-}
+		inQA, _ := taskRepo.GetByID(ctx, inQATask.ID)
+		assert.Equal(t, agent.ID, *inQA.AssignedAgentID, "in_qa must remain assigned (grace period)")
+	})
 
-func TestTaskRepo_ReleaseInFlightByAgent(t *testing.T) {
-	pool := testutil.SetupTestDB(t)
-	ctx := context.Background()
-	projRepo := pgproject.New(pool)
-	agentRepo := pgagent.New(pool)
-	taskRepo := pgtask.New(pool)
-	proj := makeProject(t, ctx, projRepo)
-	agent := makeAgent(t, ctx, agentRepo, proj.ID)
+	t.Run("ReleaseInFlightByAgent resets in_progress to ready, preserves in_qa and in_review status", func(t *testing.T) {
+		pool := testutil.SetupTestDB(t)
+		ctx := context.Background()
+		projRepo := pgproject.New(pool)
+		agentRepo := pgagent.New(pool)
+		taskRepo := pgtask.New(pool)
+		proj := makeProject(t, ctx, projRepo)
+		agent := makeAgent(t, ctx, agentRepo, proj.ID)
 
-	inProgressTask := makeTask(t, ctx, taskRepo, proj.ID)
-	advanceTask(t, ctx, taskRepo, inProgressTask.ID, domaintask.StatusInProgress)
-	require.NoError(t, taskRepo.Assign(ctx, inProgressTask.ID, agent.ID))
+		inProgressTask := makeTask(t, ctx, taskRepo, proj.ID)
+		advanceTask(t, ctx, taskRepo, inProgressTask.ID, domaintask.StatusInProgress)
+		require.NoError(t, taskRepo.Assign(ctx, inProgressTask.ID, agent.ID))
 
-	inQATask := makeTask(t, ctx, taskRepo, proj.ID)
-	advanceTask(t, ctx, taskRepo, inQATask.ID, domaintask.StatusInQA)
-	require.NoError(t, taskRepo.Assign(ctx, inQATask.ID, agent.ID))
+		inQATask := makeTask(t, ctx, taskRepo, proj.ID)
+		advanceTask(t, ctx, taskRepo, inQATask.ID, domaintask.StatusInQA)
+		require.NoError(t, taskRepo.Assign(ctx, inQATask.ID, agent.ID))
 
-	inReviewTask := makeTask(t, ctx, taskRepo, proj.ID)
-	advanceTask(t, ctx, taskRepo, inReviewTask.ID, domaintask.StatusInReview)
-	require.NoError(t, taskRepo.Assign(ctx, inReviewTask.ID, agent.ID))
+		inReviewTask := makeTask(t, ctx, taskRepo, proj.ID)
+		advanceTask(t, ctx, taskRepo, inReviewTask.ID, domaintask.StatusInReview)
+		require.NoError(t, taskRepo.Assign(ctx, inReviewTask.ID, agent.ID))
 
-	freed, err := taskRepo.ReleaseInFlightByAgent(ctx, agent.ID)
-	require.NoError(t, err)
+		freed, err := taskRepo.ReleaseInFlightByAgent(ctx, agent.ID)
+		require.NoError(t, err)
 
-	// All three statuses were freed.
-	freedSet := make(map[domaintask.Status]bool)
-	for _, s := range freed {
-		freedSet[s] = true
-	}
-	assert.True(t, freedSet[domaintask.StatusInProgress])
-	assert.True(t, freedSet[domaintask.StatusInQA])
-	assert.True(t, freedSet[domaintask.StatusInReview])
+		freedSet := make(map[domaintask.Status]bool)
+		for _, s := range freed {
+			freedSet[s] = true
+		}
+		assert.True(t, freedSet[domaintask.StatusInProgress])
+		assert.True(t, freedSet[domaintask.StatusInQA])
+		assert.True(t, freedSet[domaintask.StatusInReview])
 
-	// in_progress task reset to ready + unassigned.
-	ip, _ := taskRepo.GetByID(ctx, inProgressTask.ID)
-	assert.Equal(t, domaintask.StatusReady, ip.Status, "in_progress must be reset to ready")
-	assert.Nil(t, ip.AssignedAgentID)
+		ip, _ := taskRepo.GetByID(ctx, inProgressTask.ID)
+		assert.Equal(t, domaintask.StatusReady, ip.Status, "in_progress must be reset to ready")
+		assert.Nil(t, ip.AssignedAgentID)
 
-	// in_qa and in_review: unassigned but status preserved.
-	qa, _ := taskRepo.GetByID(ctx, inQATask.ID)
-	assert.Equal(t, domaintask.StatusInQA, qa.Status, "in_qa status must be preserved")
-	assert.Nil(t, qa.AssignedAgentID)
+		qa, _ := taskRepo.GetByID(ctx, inQATask.ID)
+		assert.Equal(t, domaintask.StatusInQA, qa.Status, "in_qa status preserved")
+		assert.Nil(t, qa.AssignedAgentID)
 
-	rev, _ := taskRepo.GetByID(ctx, inReviewTask.ID)
-	assert.Equal(t, domaintask.StatusInReview, rev.Status, "in_review status must be preserved")
-	assert.Nil(t, rev.AssignedAgentID)
+		rev, _ := taskRepo.GetByID(ctx, inReviewTask.ID)
+		assert.Equal(t, domaintask.StatusInReview, rev.Status, "in_review status preserved")
+		assert.Nil(t, rev.AssignedAgentID)
+	})
 }
 
 func TestTaskRepo_List_UnassignedFilter(t *testing.T) {
@@ -222,7 +240,6 @@ func TestTaskRepo_List_UnassignedFilter(t *testing.T) {
 	proj := makeProject(t, ctx, projRepo)
 	agent := makeAgent(t, ctx, agentRepo, proj.ID)
 
-	// One assigned, one unassigned.
 	assigned := makeTask(t, ctx, taskRepo, proj.ID)
 	advanceTask(t, ctx, taskRepo, assigned.ID, domaintask.StatusReady)
 	require.NoError(t, taskRepo.Assign(ctx, assigned.ID, agent.ID))

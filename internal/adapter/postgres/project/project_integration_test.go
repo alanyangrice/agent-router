@@ -10,37 +10,56 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	domainproject "github.com/alanyang/agent-mesh/internal/domain/project"
 	pgproject "github.com/alanyang/agent-mesh/internal/adapter/postgres/project"
+	domainproject "github.com/alanyang/agent-mesh/internal/domain/project"
 	"github.com/alanyang/agent-mesh/internal/testutil"
 )
 
-func TestProjectRepo_CreateGetByID(t *testing.T) {
+func TestProjectRepo_Create(t *testing.T) {
 	pool := testutil.SetupTestDB(t)
 	ctx := context.Background()
 	repo := pgproject.New(pool)
 
-	p := domainproject.Project{
+	proj := domainproject.Project{
 		ID:      uuid.New(),
-		Name:    "test-project",
-		RepoURL: "https://github.com/test/repo",
+		Name:    "test-" + uuid.New().String()[:8],
+		RepoURL: "https://github.com/x",
 		Config:  map[string]interface{}{},
 	}
-	created, err := repo.Create(ctx, p)
-	require.NoError(t, err)
-	assert.Equal(t, p.ID, created.ID)
-	assert.Equal(t, "test-project", created.Name)
 
-	got, err := repo.GetByID(ctx, p.ID)
+	created, err := repo.Create(ctx, proj)
 	require.NoError(t, err)
-	assert.Equal(t, p.ID, got.ID)
-	assert.Equal(t, "test-project", got.Name)
+	assert.Equal(t, proj.ID, created.ID)
+	assert.Equal(t, proj.Name, created.Name)
 }
 
-func TestProjectRepo_GetByID_NotFound(t *testing.T) {
-	pool := testutil.SetupTestDB(t)
-	repo := pgproject.New(pool)
+func TestProjectRepo_GetByID(t *testing.T) {
+	t.Run("found", func(t *testing.T) {
+		pool := testutil.SetupTestDB(t)
+		ctx := context.Background()
+		repo := pgproject.New(pool)
 
-	_, err := repo.GetByID(context.Background(), uuid.New())
-	require.Error(t, err)
+		proj := domainproject.Project{
+			ID:      uuid.New(),
+			Name:    "test-" + uuid.New().String()[:8],
+			RepoURL: "https://github.com/x",
+			Config:  map[string]interface{}{},
+		}
+		_, err := repo.Create(ctx, proj)
+		require.NoError(t, err)
+
+		got, err := repo.GetByID(ctx, proj.ID)
+		require.NoError(t, err)
+		assert.Equal(t, proj.ID, got.ID)
+		assert.Equal(t, proj.Name, got.Name)
+	})
+
+	t.Run("not found returns error", func(t *testing.T) {
+		pool := testutil.SetupTestDB(t)
+		ctx := context.Background()
+		repo := pgproject.New(pool)
+
+		_, err := repo.GetByID(ctx, uuid.New())
+		require.Error(t, err)
+	})
 }

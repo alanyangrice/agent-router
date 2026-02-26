@@ -38,90 +38,110 @@ func newProjectSvc(t *testing.T) (*projectsvc.Service, *mocks.MockProjectReposit
 
 // ── POST / (createProject) ────────────────────────────────────────────────────
 
-func TestCreateProject_Success(t *testing.T) {
-	svc, repo := newProjectSvc(t)
-	r := newRouter(svc)
+func TestCreateProject(t *testing.T) {
+	tests := []struct {
+		name     string
+		body     map[string]string
+		setup    func(repo *mocks.MockProjectRepository)
+		wantCode int
+		wantID   bool
+	}{
+		{
+			name: "success returns 201 with project",
+			body: map[string]string{"name": "proj", "repo_url": "https://github.com/foo"},
+			setup: func(repo *mocks.MockProjectRepository) {
+				created := domainproject.Project{ID: uuid.New(), Name: "proj", RepoURL: "https://github.com/foo"}
+				repo.EXPECT().Create(gomock.Any(), gomock.Any()).Return(created, nil)
+			},
+			wantCode: http.StatusCreated,
+			wantID:   true,
+		},
+		{
+			name:     "missing required fields returns 400",
+			body:     map[string]string{},
+			setup:    func(repo *mocks.MockProjectRepository) {},
+			wantCode: http.StatusBadRequest,
+		},
+		{
+			name: "service error returns 500",
+			body: map[string]string{"name": "proj", "repo_url": "https://github.com/foo"},
+			setup: func(repo *mocks.MockProjectRepository) {
+				repo.EXPECT().Create(gomock.Any(), gomock.Any()).Return(domainproject.Project{}, errors.New("db error"))
+			},
+			wantCode: http.StatusInternalServerError,
+		},
+	}
 
-	created := domainproject.Project{ID: uuid.New(), Name: "proj", RepoURL: "https://github.com/foo"}
-	repo.EXPECT().Create(gomock.Any(), gomock.Any()).Return(created, nil)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, repo := newProjectSvc(t)
+			tt.setup(repo)
+			r := newRouter(svc)
 
-	body, _ := json.Marshal(map[string]string{"name": "proj", "repo_url": "https://github.com/foo"})
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, "/projects/", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	r.ServeHTTP(w, req)
+			body, _ := json.Marshal(tt.body)
+			w := httptest.NewRecorder()
+			req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, "/projects/", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			r.ServeHTTP(w, req)
 
-	assert.Equal(t, http.StatusCreated, w.Code)
-	var got domainproject.Project
-	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
-	assert.Equal(t, created.ID, got.ID)
+			assert.Equal(t, tt.wantCode, w.Code)
+			if tt.wantID {
+				var got domainproject.Project
+				require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+				assert.NotEqual(t, uuid.Nil, got.ID)
+			}
+		})
+	}
 }
 
-func TestCreateProject_BadBody(t *testing.T) {
-	svc, _ := newProjectSvc(t)
-	r := newRouter(svc)
+// ── GET /:id (getProject) ─────────────────────────────────────────────────────
 
-	// Missing required fields.
-	body, _ := json.Marshal(map[string]string{})
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, "/projects/", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	r.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusBadRequest, w.Code)
-}
+func TestGetProject(t *testing.T) {
+	tests := []struct {
+		name     string
+		id       string
+		setup    func(repo *mocks.MockProjectRepository, id uuid.UUID)
+		wantCode int
+	}{
+		{
+			name: "success returns 200",
+			setup: func(repo *mocks.MockProjectRepository, id uuid.UUID) {
+				repo.EXPECT().GetByID(gomock.Any(), id).Return(domainproject.Project{ID: id, Name: "proj"}, nil)
+			},
+			wantCode: http.StatusOK,
+		},
+		{
+			name:     "invalid UUID returns 400",
+			id:       "not-a-uuid",
+			setup:    func(repo *mocks.MockProjectRepository, id uuid.UUID) {},
+			wantCode: http.StatusBadRequest,
+		},
+		{
+			name: "not found returns 404",
+			setup: func(repo *mocks.MockProjectRepository, id uuid.UUID) {
+				repo.EXPECT().GetByID(gomock.Any(), id).Return(domainproject.Project{}, errors.New("not found"))
+			},
+			wantCode: http.StatusNotFound,
+		},
+	}
 
-func TestCreateProject_ServiceError(t *testing.T) {
-	svc, repo := newProjectSvc(t)
-	r := newRouter(svc)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, repo := newProjectSvc(t)
+			projectID := uuid.New()
+			tt.setup(repo, projectID)
+			r := newRouter(svc)
 
-	repo.EXPECT().Create(gomock.Any(), gomock.Any()).Return(domainproject.Project{}, errors.New("db error"))
+			id := tt.id
+			if id == "" {
+				id = projectID.String()
+			}
 
-	body, _ := json.Marshal(map[string]string{"name": "proj", "repo_url": "https://github.com/foo"})
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, "/projects/", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	r.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusInternalServerError, w.Code)
-}
+			w := httptest.NewRecorder()
+			req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/projects/"+id, nil)
+			r.ServeHTTP(w, req)
 
-// ── GET /:id (getProject) ────────────────────────────────────────────────────
-
-func TestGetProject_Success(t *testing.T) {
-	svc, repo := newProjectSvc(t)
-	r := newRouter(svc)
-	projectID := uuid.New()
-
-	repo.EXPECT().GetByID(gomock.Any(), projectID).Return(domainproject.Project{ID: projectID, Name: "proj"}, nil)
-
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/projects/"+projectID.String(), nil)
-	r.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusOK, w.Code)
-
-	var got domainproject.Project
-	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
-	assert.Equal(t, projectID, got.ID)
-}
-
-func TestGetProject_InvalidID(t *testing.T) {
-	svc, _ := newProjectSvc(t)
-	r := newRouter(svc)
-
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/projects/not-a-uuid", nil)
-	r.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusBadRequest, w.Code)
-}
-
-func TestGetProject_NotFound(t *testing.T) {
-	svc, repo := newProjectSvc(t)
-	r := newRouter(svc)
-	projectID := uuid.New()
-
-	repo.EXPECT().GetByID(gomock.Any(), projectID).Return(domainproject.Project{}, errors.New("not found"))
-
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/projects/"+projectID.String(), nil)
-	r.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusNotFound, w.Code)
+			assert.Equal(t, tt.wantCode, w.Code)
+		})
+	}
 }
