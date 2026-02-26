@@ -49,11 +49,11 @@ var DefaultConfig = Config{
 	},
 	task.StatusInQA: {
 		AssignRole: "qa",
-		// FreedRole omitted: SweepUnassigned derives it from AssignRole when FreedRole is empty.
+		FreedRole:  "qa",
 	},
 	task.StatusInReview: {
 		AssignRole: "reviewer",
-		// FreedRole omitted: derived from AssignRole.
+		FreedRole:  "reviewer",
 	},
 	task.StatusMerged: {
 		BroadcastEvent: "main_updated",
